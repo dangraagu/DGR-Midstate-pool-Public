@@ -17,6 +17,11 @@ path = "src/main.rs"
 
 # The CUDA backend (cudarc + committed PTX, behind a `cuda` feature) lands next.
 
+[features]
+# Off by default → toolkit-free CPU-only build. `--features opencl` adds the
+# OpenCL GPU backend (links the system OpenCL ICD loader).
+opencl = ["dep:opencl3"]
+
 [dependencies]
 blake3 = "1.5"
 hex = "0.4"
@@ -26,6 +31,7 @@ serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 num_cpus = "1"
+opencl3 = { version = "0.9", optional = true }
 
 [profile.release]
 opt-level = 3

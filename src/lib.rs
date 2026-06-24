@@ -11,6 +11,8 @@
 
 pub mod backend;
 pub mod client;
+#[cfg(feature = "opencl")]
+pub mod opencl_backend;
 pub mod endpoint;
 pub mod pow;
 pub mod stratum;
