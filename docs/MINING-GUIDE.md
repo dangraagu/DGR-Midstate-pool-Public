@@ -373,7 +373,6 @@ Not ready. CPU is the path today (sections 7 and 9).
 - **Project README:** [`../README.md`](../README.md) — status, design notes, and
   build instructions from the maintainers.
 - **License:** [`../LICENSE`](../LICENSE) and [`../TRADEMARK.md`](../TRADEMARK.md).
-- **Roadmap:** [`docs/TODO.md`](./TODO.md).
 - **Community / Discord:** a community invite link will be published in the
   project README once it's available — check there to ask questions, get help
   finding a wallet/node, and hear about releases.
