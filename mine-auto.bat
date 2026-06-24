@@ -295,13 +295,37 @@ if "!DOUPDATE!"=="0" goto :eof
 echo [%time%] update: !INSTALLED! -^> !LATEST!  ^(verify, then swap + restart^)
 
 REM 1. Download the new binary to a TEMP path - NEVER onto the live %BIN%.
+REM    CPU-FALLBACK (mirrors mine-auto.sh download_verify_swap): if a non-cpu
+REM    (nvidia) asset 404s / fails to download, re-point EXE/BIN to the CPU build
+REM    (midstate-miner.exe, always published) and download THAT instead, so a
+REM    Windows rig is NEVER stranded on a missing GPU asset. The re-point updates
+REM    VARIANT/EXE/BIN before the SHA lookup + swap below, so the SHA256SUMS key
+REM    (%EXE%), the staged temp (%BIN%.new), and the final swap (%BIN%) all track
+REM    cpu from here on. Brick-safe: still a TEMP-path download, fail-closed if
+REM    even the cpu download fails (keep the running binary, retry next poll).
 set "NEWBIN=%BIN%.new"
 if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
 curl -L -f -o "!NEWBIN!" "https://github.com/%REPO%/releases/latest/download/%EXE%"
 if not !errorlevel!==0 (
-  echo [%time%] download failed; keeping current, will retry.
-  if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
-  goto :eof
+  if /i not "%VARIANT%"=="cpu" (
+    echo [%time%] [!] '%VARIANT%' build unavailable ^(download failed / 404^). Falling back to the cpu build.
+    if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
+    set "VARIANT=cpu"
+    set "EXE=midstate-miner.exe"
+    set "BIN=%DIR%\midstate-miner.exe"
+    set "NEWBIN=%DIR%\midstate-miner.exe.new"
+    if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
+    curl -L -f -o "!NEWBIN!" "https://github.com/%REPO%/releases/latest/download/midstate-miner.exe"
+    if not !errorlevel!==0 (
+      echo [%time%] cpu fallback download failed; keeping current, will retry.
+      if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
+      goto :eof
+    )
+  ) else (
+    echo [%time%] download failed; keeping current, will retry.
+    if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
+    goto :eof
+  )
 )
 
 REM 2. Look up the expected SHA-256 from the release SHA256SUMS.

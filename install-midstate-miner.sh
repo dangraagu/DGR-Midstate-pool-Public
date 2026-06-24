@@ -83,8 +83,14 @@ case "$VARIANT" in
     ;;
 esac
 
+# Pick the OS asset-name segment so a macOS rig fetches the macOS binary, not a
+# Linux ELF (this installer runs on both). Matches mine-auto.sh / release.yml.
+case "$(uname -s 2>/dev/null)" in
+  Darwin) PLATFORM="macos" ;;
+  *)      PLATFORM="linux" ;;
+esac
 if [ "$VARIANT" = "cpu" ]; then
-  BIN_NAME="midstate-miner-linux"
+  BIN_NAME="midstate-miner-$PLATFORM"
 else
   BIN_NAME="midstate-miner-linux-$VARIANT"
 fi
@@ -103,6 +109,45 @@ if ! download "$URL" "$BIN"; then
   echo
   exit 1
 fi
+
+# --- 2a. Verify the downloaded binary against the release SHA256SUMS --------
+# Defence in depth on the FIRST fetch (TLS already authenticates the GitHub CDN,
+# but this also catches a truncated download / a tampered asset). FAIL CLOSED:
+# any missing checksums file, missing entry, missing verifier, or hash mismatch
+# removes the unverified binary and aborts the install. Nothing is running yet,
+# so aborting can never brick a rig. The SHA256SUMS line format is
+# `<hex>  <filename>` (sha256sum style); we match $BIN_NAME exactly.
+echo "Verifying $BIN_NAME against the release SHA256SUMS ..."
+SUMS_TMP="$DATA_DIR/SHA256SUMS.install"
+if ! download "https://github.com/$REPO/releases/latest/download/SHA256SUMS" "$SUMS_TMP" 2>/dev/null; then
+  rm -f "$BIN"
+  echo "[X] Could not fetch SHA256SUMS - refusing to install an unverified binary." >&2
+  echo "    Releases: https://github.com/$REPO/releases/latest" >&2
+  exit 1
+fi
+WANT="$(awk -v a="$BIN_NAME" '$2==a || $2=="*"a {print $1; exit}' "$SUMS_TMP")"
+rm -f "$SUMS_TMP"
+if [ -z "$WANT" ]; then
+  rm -f "$BIN"
+  echo "[X] '$BIN_NAME' is not listed in SHA256SUMS - refusing the install (fail-closed)." >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  GOT="$(sha256sum "$BIN" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  # macOS ships `shasum` (not `sha256sum`).
+  GOT="$(shasum -a 256 "$BIN" | awk '{print $1}')"
+else
+  rm -f "$BIN"
+  echo "[X] No sha256sum/shasum available to verify the download - refusing (fail-closed)." >&2
+  exit 1
+fi
+if [ "$GOT" != "$WANT" ]; then
+  rm -f "$BIN"
+  echo "[X] SHA-256 verify FAILED for $BIN_NAME (got $GOT, want $WANT) - aborting install." >&2
+  exit 1
+fi
+echo "  -> verified ($WANT)."
 chmod +x "$BIN"
 
 # --- 2b. Also fetch the auto-update launcher next to this file -------------

@@ -1,57 +1,67 @@
 name: release
 
-# Builds the Windows + Linux Midstate miner binaries and publishes them to a
-# GitHub Release.
+# Builds the default (CPU) Midstate miner binary for Windows + Linux + macOS and
+# publishes them to a GitHub Release, together with the self-updating launchers,
+# a version-pointer, and a SHA256SUMS file the launchers verify every download
+# against.
 #
 # Triggers:
-#   * push a tag  v*   -> build all variants AND publish them to the release
+#   * push a tag  v*   -> build every OS AND publish them to the release
 #   * workflow_dispatch -> build only (smoke-test that everything compiles)
 #
-# Backends: Midstate's miner is CPU (AVX2) + NVIDIA-CUDA only. There is NO
-# OpenCL/AMD build — AMD GPUs are out of scope for now, so (unlike the CSD
-# miner) there is no opencl variant in the matrix.
+# Backends: only the DEFAULT (CPU) build is published. The miner's PoW is a
+# SEQUENTIAL BLAKE3 chain (GPU-resistant), so the toolkit-free CPU build is the
+# product. There is intentionally NO cuda variant (no such cargo feature exists)
+# and NO opencl variant (opencl is a self-build per docs/MINING-GUIDE.md). If a
+# GPU backend is wired up later, add its job + asset name here AND the matching
+# launcher download name in the SAME change.
 #
-# Assets produced (consumed by mine-auto.bat / mine-auto.sh self-update):
-#   midstate-miner-windows-cpu.exe     / midstate-miner-linux-cpu      (always; no GPU deps)
-#   midstate-miner-windows-nvidia.exe  / midstate-miner-linux-nvidia   (CUDA; best-effort)
-#   mine-auto.bat / mine-auto.sh                                       (self-updating launchers)
-#   latest-version.txt                                                 (just the version string, e.g. "0.1.0";
-#                                                                       CDN-served so the launchers resolve
-#                                                                       "latest" WITHOUT the 60/hr GitHub API limit)
-#   SHA256SUMS                                                         (digests of all the above)
+# ────────────────────────────────────────────────────────────────────────────
+# ASSET-NAME CONTRACT (the load-bearing invariant)
+# ────────────────────────────────────────────────────────────────────────────
+# The name a job UPLOADS == the name a launcher DOWNLOADS == the name in
+# SHA256SUMS. The launchers fetch these exact basenames from
+# releases/latest/download/<NAME>, key the SHA256SUMS lookup on the SAME
+# basename, and FAIL CLOSED if either the asset or its checksum line is absent.
+# So these names are NOT free to change without changing the launchers too:
+#
+#   midstate-miner.exe        Windows CPU  (mine-auto.bat / install-midstate-miner.bat: EXE=midstate-miner.exe)
+#   midstate-miner-linux      Linux   CPU  (mine-auto.sh  / install-midstate-miner.sh:  BIN_NAME=midstate-miner-linux)
+#   midstate-miner-macos      macOS   CPU  (mine-auto.sh on Darwin: BIN_NAME=midstate-miner-macos)
+#   mine-auto.sh / mine-auto.bat           (self-updating launchers; SHA-verified self-update)
+#   latest-version.txt                     (bare version string, CDN-served so the
+#                                           launchers resolve "latest" WITHOUT the
+#                                           60/hr unauthenticated GitHub API limit)
+#   SHA256SUMS                             (sha256sum-format digests of all of the above)
 #
 # Single-publisher design
 # ────────────────────────────────────────────────────────────────────────────
-# The two OS build jobs upload their artifacts; a final `release` job downloads
-# them all, generates ONE SHA256SUMS over every asset, and publishes the lot in
-# a single step. That single-publisher design is what lets SHA256SUMS cover
-# assets from BOTH OS jobs without two jobs racing to write the same digests
-# file, and it is what the self-update integrity check (mine-auto's verify-file)
-# compares a downloaded binary against — without SHA256SUMS the updater has
-# nothing to verify a download against, so this job is load-bearing, not
-# cosmetic.
+# The three OS build jobs upload their artifacts; a final `release` job downloads
+# them all, generates ONE SHA256SUMS over every asset, and publishes the lot in a
+# single step. That single-publisher design is what lets SHA256SUMS cover assets
+# from ALL OS jobs without jobs racing to write the same digests file, and it is
+# what the self-update integrity check (mine-auto's verify-file) compares a
+# downloaded binary against — without SHA256SUMS the updater has nothing to verify
+# a download against, so this job is load-bearing, not cosmetic.
 #
 # Staging mine-auto.{sh,bat} as release assets is mandatory, NOT optional: the
 # launcher self-update downloads releases/latest/download/mine-auto.{sh,bat} and
-# SHA-verifies it against SHA256SUMS. If these are not published, self-update is
-# a permanent no-op (the asset 404s / has no checksum entry).
+# SHA-verifies it against SHA256SUMS. If these are not published, self-update is a
+# permanent no-op (the asset 404s / has no checksum entry).
 #
 # NOTE for the operator: before tagging, confirm src/endpoint.rs points at the
 # intended live pool. It is ALREADY set to the production endpoint (verified by
 # the pool_endpoint_decodes_to_expected test) — the binary does NOT ship a
 # placeholder; only edit it if you want to ship a different pool.
-#
-# FIRST-RUN ITERATION POINTS (these run on GitHub, not locally — watch the logs):
-#   * The CPU build is the safe one and should always succeed.
-#   * The NVIDIA build is marked continue-on-error so a failure there does NOT
-#     block the CPU release. (Once the `cuda` cargo feature + committed PTX land
-#     in the crate, this is the variant most likely to need a first-run tweak.)
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch: {}
 
+# Least privilege: only the write access needed for softprops/action-gh-release
+# to create the release with the default GITHUB_TOKEN. No external/long-lived
+# secrets are referenced anywhere in this workflow.
 permissions:
   contents: write
 
@@ -68,20 +78,13 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Force dist | Out-Null
 
-      - name: Build CPU (always works, no GPU deps)
+      # Default (CPU) build. No --features: toolkit-free, always compiles on the
+      # stock runner. Uploaded under the EXACT name the Windows launchers fetch.
+      - name: Build CPU
         shell: pwsh
         run: |
           cargo build --release
-          Copy-Item target/release/midstate-miner.exe dist/midstate-miner-windows-cpu.exe
-
-      # NVIDIA (cuda): best-effort. continue-on-error keeps the CPU release
-      # shipping even if the CUDA build is not yet wired up / fails on the runner.
-      - name: Build NVIDIA (cuda)
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          cargo build --release --features cuda
-          Copy-Item target/release/midstate-miner.exe dist/midstate-miner-windows-nvidia.exe
+          Copy-Item target/release/midstate-miner.exe dist/midstate-miner.exe
 
       - name: List built artifacts
         shell: pwsh
@@ -105,28 +108,21 @@ jobs:
       - name: Prepare dist folder
         run: mkdir -p dist
 
-      - name: Build CPU (always works, no GPU deps)
+      # Default (CPU) build. Uploaded under the EXACT name the Linux launchers
+      # fetch (BIN_NAME=midstate-miner-linux).
+      - name: Build CPU
         run: |
           cargo build --release
-          cp target/release/midstate-miner dist/midstate-miner-linux-cpu
-
-      # NVIDIA: the CUDA backend (cudarc) dlopens the driver at runtime and JITs a
-      # committed PTX, so this build needs NO CUDA Toolkit on the runner.
-      # continue-on-error keeps CPU shipping.
-      - name: Build NVIDIA (cuda)
-        continue-on-error: true
-        run: |
-          cargo build --release --features cuda
-          cp target/release/midstate-miner dist/midstate-miner-linux-nvidia
+          cp target/release/midstate-miner dist/midstate-miner-linux
 
       # Publish the self-updating launchers as release assets. Existing rigs
       # refresh them by downloading releases/latest/download/mine-auto.{sh,bat}
       # and SHA-verifying it against the release SHA256SUMS (FAIL-CLOSED if the
-      # asset or its checksum is absent). Staging them here — in the SAME linux
-      # job whose dist/ the single release job flattens and checksums — is what
-      # makes SHA256SUMS cover them WITHOUT a second publisher racing the digests
-      # file. Without this step the launcher self-update is a permanent no-op
-      # (the asset 404s / has no checksum entry).
+      # asset or its checksum is absent). Staging them here — in the SAME job
+      # whose dist/ the single release job flattens and checksums — is what makes
+      # SHA256SUMS cover them WITHOUT a second publisher racing the digests file.
+      # Without this step the launcher self-update is a permanent no-op (the asset
+      # 404s / has no checksum entry).
       - name: Stage self-updating launchers (mine-auto.sh / mine-auto.bat)
         run: |
           set -euo pipefail
@@ -137,14 +133,14 @@ jobs:
             echo "::warning::mine-auto.sh / mine-auto.bat not found in repo root — self-update launchers will NOT be published this release."
           fi
 
-      # FIX: publish a tiny version-pointer asset. The launchers resolve "latest"
-      # by GETting this over the releases/latest/download/ CDN, which is NOT
-      # subject to the unauthenticated api.github.com 60-req/hr/IP limit (the
-      # limit that silently freezes whole farms behind one public IP). Bare
-      # version, no leading 'v', single line. SHA256SUMS (generated in the
-      # release job over every dist/ file) covers it too, so a tampered
-      # version-pointer is detectable — but it only selects WHICH version to
-      # fetch; the binary itself is still SHA-verified before any swap.
+      # Publish a tiny version-pointer asset. The launchers resolve "latest" by
+      # GETting this over the releases/latest/download/ CDN, which is NOT subject
+      # to the unauthenticated api.github.com 60-req/hr/IP limit (the limit that
+      # silently freezes whole farms behind one public IP). Bare version, no
+      # leading 'v', single line. SHA256SUMS (generated in the release job over
+      # every dist/ file) covers it too, so a tampered version-pointer is
+      # detectable — but it only selects WHICH version to fetch; the binary itself
+      # is still SHA-verified before any swap.
       - name: Write latest-version.txt
         run: |
           set -euo pipefail
@@ -166,12 +162,41 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Prepare dist folder
+        run: mkdir -p dist
+
+      # Default (CPU) build. macos-latest is Apple-silicon (aarch64); the asset is
+      # the native host triple. Uploaded under the EXACT name mine-auto.sh fetches
+      # on Darwin (BIN_NAME=midstate-miner-macos).
+      - name: Build CPU
+        run: |
+          cargo build --release
+          cp target/release/midstate-miner dist/midstate-miner-macos
+
+      - name: List built artifacts
+        run: ls -la dist
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: dist/*
+          if-no-files-found: error
+
   # Single publisher: gather every built asset, emit ONE SHA256SUMS over all of
   # them, then publish binaries + launchers + version-pointer + SHA256SUMS
-  # together. Runs only on a tag (the build jobs still run on workflow_dispatch
-  # as a compile smoke test, but nothing is published there).
+  # together. Runs only on a tag (the build jobs still run on workflow_dispatch as
+  # a compile smoke test, but nothing is published there).
   release:
-    needs: [windows, linux]
+    needs: [windows, linux, macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -184,14 +209,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # Flatten dist-windows/ and dist-linux/ into one dist/.
+          # Flatten dist-windows/, dist-linux/, dist-macos/ into one dist/.
           find artifacts -type f -exec cp -t dist/ {} +
           cd dist
           # One checksums file over every published asset (sha256sum format:
           # "<hex>  <filename>"), which verify-file / sha256sum -c read back.
           # Build an explicit file list that EXCLUDES SHA256SUMS itself so the
           # digests file can never (self-)reference a partially-written copy of
-          # itself regardless of glob/redirect ordering.
+          # itself regardless of glob/redirect ordering. The filename field here
+          # is the EXACT basename the launchers look up (midstate-miner.exe,
+          # midstate-miner-linux, midstate-miner-macos, mine-auto.sh, ...), which
+          # is what makes upload == download == SHA256SUMS key.
           find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort > .asset-list
           xargs -a .asset-list sha256sum -- > SHA256SUMS
           rm -f .asset-list

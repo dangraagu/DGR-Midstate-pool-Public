@@ -56,8 +56,19 @@ esac
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/midstate-miner"
 CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/midstate-miner"
 CFG="$CFG_DIR/address.txt"
+
+# Pick the OS asset-name segment so a macOS rig fetches the macOS binary, not a
+# Linux ELF (this same bash launcher runs on both). The release publishes
+# midstate-miner-linux and midstate-miner-macos; PLATFORM selects which.
+case "$(uname -s 2>/dev/null)" in
+  Darwin) PLATFORM="macos" ;;
+  *)      PLATFORM="linux" ;;
+esac
+# Asset basename. cpu => midstate-miner-<platform>; a GPU variant (e.g. nvidia,
+# linux only) => midstate-miner-linux-<variant>. The name here MUST equal the
+# release asset + its SHA256SUMS key (see release.yml ASSET-NAME CONTRACT).
 if [ "$VARIANT" = "cpu" ]; then
-  BIN_NAME="midstate-miner-linux"
+  BIN_NAME="midstate-miner-$PLATFORM"
 else
   BIN_NAME="midstate-miner-linux-$VARIANT"
 fi
@@ -161,7 +172,7 @@ download_verify_swap() {
     if [ "$VARIANT" != "cpu" ]; then
       echo "[!] '$VARIANT' build unavailable (download failed / 404). Falling back to the cpu build." >&2
       VARIANT="cpu"
-      BIN_NAME="midstate-miner-linux"
+      BIN_NAME="midstate-miner-$PLATFORM"
       BIN="$DATA_DIR/$BIN_NAME"
       staged="$BIN.new"
       download "https://github.com/$REPO/releases/latest/download/$BIN_NAME" "$staged" || return 1

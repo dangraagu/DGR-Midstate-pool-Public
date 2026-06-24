@@ -74,6 +74,50 @@ if !errorlevel! NEQ 0 (
   exit /b 1
 )
 
+REM --- 3a. Verify the downloaded binary against the release SHA256SUMS ---
+REM Defence in depth on the FIRST fetch (TLS already authenticates the GitHub
+REM CDN, but this also catches a truncated download / a tampered asset). FAIL
+REM CLOSED: a missing checksums file, a missing/unlisted entry, no verifier, or a
+REM hash mismatch deletes the unverified binary and aborts. Nothing is running
+REM yet, so aborting can never brick a rig. The SHA256SUMS file is LF-only
+REM (Linux sha256sum), so use the LF-safe PowerShell selector (mirrors
+REM mine-auto.bat): match the line whose EXACT filename field == %EXE% and emit
+REM its 64-hex digest.
+echo Verifying %EXE% against the release SHA256SUMS ...
+set "WANT="
+set "SUMS=%DIR%\SHA256SUMS.install"
+if exist "!SUMS!" del /f /q "!SUMS!" >nul 2>&1
+curl -L -f -s -o "!SUMS!" "https://github.com/%REPO%/releases/latest/download/SHA256SUMS" >nul 2>&1
+if exist "!SUMS!" (
+  for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "$a='%EXE%'; $h=''; foreach($ln in (Get-Content -LiteralPath '!SUMS!')){ $p=@($ln -split '\s+' ^| Where-Object { $_ -ne '' }); if($p.Count -ge 2 -and ($p[1] -eq $a -or $p[1] -eq ('*'+$a)) -and $p[0] -match '^[0-9A-Fa-f]{64}$'){ $h=$p[0]; break } }; $h"`) do set "WANT=%%a"
+  del /f /q "!SUMS!" >nul 2>&1
+)
+if not defined WANT (
+  echo(
+  echo [X] Could not verify %EXE% ^(no SHA256SUMS published, or %EXE% not listed^).
+  echo     Refusing to install an unverified binary.
+  echo     Releases: https://github.com/%REPO%/releases/latest
+  echo(
+  if exist "%BIN%" del /f /q "%BIN%" >nul 2>&1
+  pause
+  exit /b 1
+)
+set "GOT="
+for /f "usebackq delims=" %%h in (`powershell -NoProfile -Command "try { (Get-FileHash -Algorithm SHA256 -LiteralPath '%BIN%').Hash.ToLower() } catch { '' }"`) do set "GOT=%%h"
+if not defined GOT (
+  echo [X] No usable verifier ^(Get-FileHash failed^) - refusing the install.
+  if exist "%BIN%" del /f /q "%BIN%" >nul 2>&1
+  pause
+  exit /b 1
+)
+if /i not "!GOT!"=="!WANT!" (
+  echo [X] SHA-256 verify FAILED for %EXE% ^(got !GOT! want !WANT!^) - aborting install.
+  if exist "%BIN%" del /f /q "%BIN%" >nul 2>&1
+  pause
+  exit /b 1
+)
+echo   -^> verified ^(!WANT!^).
+
 REM --- 3b. Also fetch the auto-update launcher next to this file ---
 echo Fetching the auto-update launcher ...
 where curl >nul 2>&1
