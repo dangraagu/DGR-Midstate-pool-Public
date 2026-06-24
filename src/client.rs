@@ -125,8 +125,16 @@ fn session(
                                 j.job_id,
                                 hex::encode(&j.midstate[..6])
                             );
-                            *rs.job.lock().unwrap() = Some(j);
-                            rs.epoch.fetch_add(1, Ordering::Release);
+                            // Publish job + epoch atomically under ONE lock. If the epoch
+                            // were bumped after releasing the job lock, the mining loop's
+                            // locked (job, epoch) read could observe the new job paired with
+                            // the old epoch, and the pre-submit freshness guard would then
+                            // spuriously drop a valid share found for that very job.
+                            {
+                                let mut g = rs.job.lock().unwrap();
+                                *g = Some(j);
+                                rs.epoch.fetch_add(1, Ordering::Release);
+                            }
                         }
                         Event::AuthAck(ok) => {
                             println!("[miner] authorize: {ok}");
