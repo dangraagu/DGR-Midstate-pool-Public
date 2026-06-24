@@ -1,0 +1,12 @@
+# Pin LF on shell / systemd / env files — CRLF corrupts systemd units and a
+# CRLF in a SHA-extracted line once froze a whole fleet (CSD lesson).
+*.sh    text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+*.env   text eol=lf
+*.ptx   binary
+
+# Normal text for the rest.
+*.rs   text
+*.toml text
+*.md   text

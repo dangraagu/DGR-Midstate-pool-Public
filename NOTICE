@@ -1,0 +1,10 @@
+Required Notice: Copyright 2026 Daniel Gustav Raastad (DGR) — https://github.com/dangraagu/DGR-Midstate-pool-Public
+
+This software (the Midstate pool miner) is licensed under the PolyForm Perimeter
+License 1.0.0 (see LICENSE). The source is public so you can read and audit it;
+the license does not permit using it to build or operate a competing product or
+pool, nor redistributing or reselling it.
+
+"Midstate" is the name of the underlying public proof-of-work blockchain (an
+independent project); this repository is a third-party pool client for that
+chain. References to "Midstate" are nominative. See TRADEMARK.md.

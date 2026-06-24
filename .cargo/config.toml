@@ -1,0 +1,9 @@
+# Defender-safe / privacy: scrub the build-host home directory from the shipped
+# binary. Under panic="unwind" the username would otherwise leak hundreds of
+# times in panic metadata. Covers Windows, git-bash, and WSL path spellings.
+[build]
+rustflags = [
+    "--remap-path-prefix=C:\\Users\\bahs_admin=.",
+    "--remap-path-prefix=/c/Users/bahs_admin=.",
+    "--remap-path-prefix=/mnt/c/Users/bahs_admin=.",
+]

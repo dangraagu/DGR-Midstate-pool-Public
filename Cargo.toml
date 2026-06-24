@@ -1,0 +1,31 @@
+[package]
+name = "midstate-pool-miner"
+version = "0.1.0"
+edition = "2021"
+license-file = "LICENSE"
+description = "Open-source pool miner for Midstate (post-quantum, BLAKE3 sequential-VDF PoW). Pool-only, endpoint-locked."
+repository = "https://github.com/dangraagu/DGR-Midstate-pool-Public"
+publish = false
+
+[lib]
+name = "midstate_miner"
+path = "src/lib.rs"
+
+# NOTE: the binary ([[bin]] midstate-miner -> src/main.rs), the CLI/Stratum
+# deps (clap/serde/ureq), and the optional `cuda` feature (cudarc + committed
+# PTX) land in the next milestone. This foundation crate compiles + tests the
+# two consensus/lock-critical pieces first: the bit-exact PoW and the
+# endpoint-lock.
+
+[dependencies]
+blake3 = "1.5"
+hex = "0.4"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+debug = false
+panic = "unwind"

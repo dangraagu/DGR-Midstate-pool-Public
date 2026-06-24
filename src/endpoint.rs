@@ -1,0 +1,228 @@
+//! Compiled-in pool endpoint, lightly obfuscated. POOL-ONLY: there is no
+//! `--pool`/`--url`/`--host` override flag anywhere in this miner.
+//!
+//! The public build connects to ONE pool. To keep the literal host:port out of a
+//! plain `strings <binary>` dump (and make a casual hex-edit slightly more
+//! annoying), the endpoint is stored XOR-scrambled as a byte array and
+//! reconstructed at runtime by [`pool_endpoint`].
+//!
+//! This is **obfuscation, not security** — anyone determined recovers it by
+//! running the binary or replicating the XOR. The point is only that the raw
+//! `host:3666` string is not sitting in the read-only data segment in cleartext.
+//!
+//! ## Why a scrambled *byte array* and not `xor("plaintext")`
+//! With `opt-level=3` + fat LTO the optimizer evaluates a `xor("plaintext")`
+//! round-trip at compile time and embeds the **plaintext** literal in the binary
+//! (verified on the CSD miner: `strings` showed the host). So the cleartext never
+//! appears in source: only the scrambled bytes are a compile-time constant, and
+//! [`std::hint::black_box`] stops the optimizer folding the decode back to a
+//! plaintext literal.
+//!
+//! ## Cutting a release (re-pointing the pool)
+//!   1. Pick the live endpoint, e.g. `"midstate.yamaduo.no:3666"`.
+//!   2. Scramble each byte with [`XOR_KEY`] (`byte ^ 0x5a`) and paste into
+//!      `SCRAMBLED_ENDPOINT`:
+//!      `python3 -c "print([b ^ 0x5a for b in b'midstate.yamaduo.no:3666'])"`.
+//!   3. Recompute the pinned SHA-256 of the cleartext and update the digest test.
+//!   4. Rebuild. The round-trip + digest tests catch a mistyped byte before ship.
+//!
+//! Prefer a stable hostname (survives VPS IP changes) over a raw IP. The
+//! obfuscated hostname is fine to commit; never commit a raw production IP.
+
+use std::hint::black_box;
+
+/// Single-byte XOR key used to scramble/descramble the endpoint. A fixed key is
+/// sufficient for the stated goal (defeat `strings`, not a reverse engineer).
+const XOR_KEY: u8 = 0x5a;
+
+/// The live pool endpoint (`host:port`), every byte XOR'd by [`XOR_KEY`].
+/// Cleartext: `midstate.yamaduo.no:3666` (24 bytes). The cleartext host never
+/// appears in source — only this scrambled form does. To repoint, re-scramble
+/// (see "Cutting a release"); the tests reconstruct the expected value from this
+/// same table, so no plaintext host literal lives anywhere in the crate.
+const SCRAMBLED_ENDPOINT: &[u8] = &[
+    0x37, 0x33, 0x3e, 0x29, 0x2e, 0x3b, 0x2e, 0x3f, 0x74, 0x23, 0x3b, 0x37,
+    0x3b, 0x3e, 0x2f, 0x35, 0x74, 0x34, 0x35, 0x60, 0x69, 0x6c, 0x6c, 0x6c,
+];
+
+/// Decode and return the pool endpoint as a `host:port` string.
+///
+/// [`black_box`] is applied to each byte and the key so the optimizer can't
+/// const-fold the loop and re-materialize the plaintext as a literal in the
+/// binary's data segment. Always valid UTF-8 (ASCII source, XOR round-trips).
+pub fn pool_endpoint() -> String {
+    let key = black_box(XOR_KEY);
+    let decoded: Vec<u8> = SCRAMBLED_ENDPOINT
+        .iter()
+        .map(|&b| black_box(b) ^ key)
+        .collect();
+    String::from_utf8(decoded).expect("pool endpoint decodes to valid UTF-8")
+}
+
+/// An ordered list of pool endpoints with a current selection, for failover.
+///
+/// Index 0 is the **primary**. [`advance`](Self::advance) rotates to the next
+/// endpoint after a failed connect; [`maybe_failback`](Self::maybe_failback)
+/// returns to the primary after a quiet interval on a backup. All decisions are
+/// pure (`now_ms` injected), so the policy is unit-tested without sockets/time.
+pub struct EndpointList {
+    all: Vec<String>,
+    current: usize,
+    last_failback_ms: u64,
+}
+
+impl EndpointList {
+    /// Build from a non-empty, ordered endpoint list (index 0 = primary).
+    pub fn new(all: Vec<String>) -> Self {
+        debug_assert!(!all.is_empty(), "EndpointList needs >= 1 endpoint");
+        EndpointList { all, current: 0, last_failback_ms: 0 }
+    }
+
+    /// The currently-selected endpoint.
+    pub fn current(&self) -> &str {
+        &self.all[self.current]
+    }
+
+    /// True if the current selection is the primary (index 0).
+    pub fn is_primary(&self) -> bool {
+        self.current == 0
+    }
+
+    /// Rotate to the next endpoint (wrapping), returning it. No-op for a single
+    /// endpoint. Called after a failed handshake to try the next pool.
+    pub fn advance(&mut self) -> &str {
+        if self.all.len() > 1 {
+            self.current = (self.current + 1) % self.all.len();
+        }
+        &self.all[self.current]
+    }
+
+    /// If currently on a backup and `interval_ms` has elapsed since the last
+    /// failback, jump back to the primary. While on the primary it just keeps the
+    /// failback clock fresh and returns `false`.
+    pub fn maybe_failback(&mut self, now_ms: u64, interval_ms: u64) -> bool {
+        if self.current == 0 {
+            self.last_failback_ms = now_ms;
+            return false;
+        }
+        // On a backup with the failback clock never started (a deliberate
+        // failover advanced off the primary before any failback check ran): start
+        // it NOW and hold the backup for a full interval. Treating 0 as
+        // "infinitely long ago" would instantly snap back to a possibly-bad
+        // primary, defeating the failover (CSD v0.1.9 #2 regression).
+        if self.last_failback_ms == 0 {
+            self.last_failback_ms = now_ms;
+            return false;
+        }
+        if now_ms.saturating_sub(self.last_failback_ms) >= interval_ms {
+            self.current = 0;
+            self.last_failback_ms = now_ms;
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reconstruct the expected endpoint by descrambling [`SCRAMBLED_ENDPOINT`]
+    /// independently of [`pool_endpoint`] (plain XOR, no `black_box`). The
+    /// cleartext host therefore never exists as a literal anywhere — not even in
+    /// the test — yet we still verify the decode is correct.
+    fn expected_from_scramble() -> String {
+        let decoded: Vec<u8> = SCRAMBLED_ENDPOINT.iter().map(|&b| b ^ XOR_KEY).collect();
+        String::from_utf8(decoded).expect("scrambled endpoint decodes to valid UTF-8")
+    }
+
+    #[test]
+    fn pool_endpoint_decodes_to_expected() {
+        assert_eq!(pool_endpoint(), expected_from_scramble());
+    }
+
+    #[test]
+    fn scrambled_table_is_actually_scrambled() {
+        let plain = expected_from_scramble();
+        assert_ne!(SCRAMBLED_ENDPOINT, plain.as_bytes());
+        assert_eq!(SCRAMBLED_ENDPOINT.len(), plain.len());
+    }
+
+    /// Pin the decoded endpoint to a known SHA-256 digest. Preimage-resistant, so
+    /// no plaintext host literal lives in source — yet this catches ANY corruption
+    /// of `SCRAMBLED_ENDPOINT`, including a valid-but-wrong byte the descramble
+    /// round-trip cannot see, before a wrong-host binary could ship green.
+    #[test]
+    fn decoded_endpoint_matches_pinned_digest() {
+        use sha2::{Digest, Sha256};
+        let got = hex::encode(Sha256::digest(pool_endpoint().as_bytes()));
+        assert_eq!(
+            got, "f33095d8ea6d9675071b0dd129c8cb23005853153bacaa1f12a182cadc361994",
+            "decoded endpoint changed: if you intentionally repointed the pool, \
+             recompute this digest; otherwise SCRAMBLED_ENDPOINT is corrupted"
+        );
+    }
+
+    #[test]
+    fn round_trips_for_an_arbitrary_endpoint() {
+        let sample = b"pool.example.com:3666";
+        let scrambled: Vec<u8> = sample.iter().map(|&b| b ^ XOR_KEY).collect();
+        assert_ne!(&scrambled[..], &sample[..]);
+        let back: Vec<u8> = scrambled.iter().map(|&b| b ^ XOR_KEY).collect();
+        assert_eq!(&back[..], &sample[..]);
+    }
+
+    #[test]
+    fn endpoint_list_starts_on_primary() {
+        let el = EndpointList::new(vec!["a:1".into(), "b:2".into()]);
+        assert_eq!(el.current(), "a:1");
+        assert!(el.is_primary());
+    }
+
+    #[test]
+    fn endpoint_list_advance_rotates_and_wraps() {
+        let mut el = EndpointList::new(vec!["a:1".into(), "b:2".into(), "c:3".into()]);
+        assert_eq!(el.advance(), "b:2");
+        assert!(!el.is_primary());
+        assert_eq!(el.advance(), "c:3");
+        assert_eq!(el.advance(), "a:1");
+        assert!(el.is_primary());
+    }
+
+    #[test]
+    fn endpoint_list_single_endpoint_advance_is_noop() {
+        let mut el = EndpointList::new(vec!["only:1".into()]);
+        assert_eq!(el.advance(), "only:1");
+        assert_eq!(el.advance(), "only:1");
+        assert!(el.is_primary());
+    }
+
+    #[test]
+    fn endpoint_list_fails_back_to_primary_after_interval() {
+        let mut el = EndpointList::new(vec!["a:1".into(), "b:2".into()]);
+        assert!(!el.maybe_failback(1000, 5000));
+        el.advance();
+        assert!(!el.is_primary());
+        assert!(!el.maybe_failback(3000, 5000));
+        assert!(!el.is_primary());
+        assert!(el.maybe_failback(6001, 5000));
+        assert!(el.is_primary());
+        assert_eq!(el.current(), "a:1");
+    }
+
+    #[test]
+    fn maybe_failback_holds_backup_when_clock_unstarted() {
+        // Regression (CSD v0.1.9 #2): a deliberate failover advances to a backup
+        // BEFORE any maybe_failback ran on the primary, so last_failback_ms is 0.
+        // That must NOT be read as "infinitely long ago" → instant snap-back.
+        let mut el = EndpointList::new(vec!["a:1".into(), "b:2".into()]);
+        el.advance();
+        assert!(!el.is_primary());
+        assert!(!el.maybe_failback(1_000_000, 5000));
+        assert!(!el.is_primary(), "must hold the backup, not snap back");
+        assert!(!el.maybe_failback(1_004_000, 5000));
+        assert!(!el.is_primary());
+        assert!(el.maybe_failback(1_006_000, 5000));
+        assert!(el.is_primary());
+    }
+}

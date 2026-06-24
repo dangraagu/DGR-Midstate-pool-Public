@@ -1,0 +1,5 @@
+/target
+*.pdb
+*.exe
+.DS_Store
+# Cargo.lock IS committed (binary crate) — do not ignore it.
