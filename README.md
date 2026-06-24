@@ -11,6 +11,8 @@ endpoint is compiled in. The only thing you provide is your payout address.
 **▶ Want to mine? Read the [Mining guide](docs/MINING-GUIDE.md)** — a zero-to-mining
 walkthrough: build, run, the exact flags, what a healthy run looks like, and troubleshooting.
 
+**💬 Community:** [Join the Discord](https://discord.gg/zqVDC3By2x) for help, support, and release announcements.
+
 > **Status: early development.** The consensus core is done and validated — the
 > bit-exact PoW (matches the network's golden vectors) and the compiled-in
 > pool-lock both pass their tests. The Stratum client, the CPU/CUDA backends, and
