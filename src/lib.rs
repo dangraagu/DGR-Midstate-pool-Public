@@ -9,8 +9,17 @@
 //! (each nonce = a 1,000,000-iteration hash chain). See [`pow`] for the exact
 //! consensus contract.
 
+pub mod backend;
+pub mod client;
 pub mod endpoint;
 pub mod pow;
+pub mod stratum;
+pub mod target;
+pub mod threads;
 
+pub use backend::{Backend, CpuBackend, Found};
 pub use endpoint::{pool_endpoint, EndpointList};
 pub use pow::{meets_target, midstate_pow, midstate_pow_n, EXTENSION_ITERATIONS};
+pub use stratum::{classify, Event, Incoming, Job, RpcRequest};
+pub use target::share_target;
+pub use threads::cpu_thread_budget;

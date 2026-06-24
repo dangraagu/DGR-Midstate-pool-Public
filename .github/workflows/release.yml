@@ -1,0 +1,205 @@
+name: release
+
+# Builds the Windows + Linux Midstate miner binaries and publishes them to a
+# GitHub Release.
+#
+# Triggers:
+#   * push a tag  v*   -> build all variants AND publish them to the release
+#   * workflow_dispatch -> build only (smoke-test that everything compiles)
+#
+# Backends: Midstate's miner is CPU (AVX2) + NVIDIA-CUDA only. There is NO
+# OpenCL/AMD build — AMD GPUs are out of scope for now, so (unlike the CSD
+# miner) there is no opencl variant in the matrix.
+#
+# Assets produced (consumed by mine-auto.bat / mine-auto.sh self-update):
+#   midstate-miner-windows-cpu.exe     / midstate-miner-linux-cpu      (always; no GPU deps)
+#   midstate-miner-windows-nvidia.exe  / midstate-miner-linux-nvidia   (CUDA; best-effort)
+#   mine-auto.bat / mine-auto.sh                                       (self-updating launchers)
+#   latest-version.txt                                                 (just the version string, e.g. "0.1.0";
+#                                                                       CDN-served so the launchers resolve
+#                                                                       "latest" WITHOUT the 60/hr GitHub API limit)
+#   SHA256SUMS                                                         (digests of all the above)
+#
+# Single-publisher design
+# ────────────────────────────────────────────────────────────────────────────
+# The two OS build jobs upload their artifacts; a final `release` job downloads
+# them all, generates ONE SHA256SUMS over every asset, and publishes the lot in
+# a single step. That single-publisher design is what lets SHA256SUMS cover
+# assets from BOTH OS jobs without two jobs racing to write the same digests
+# file, and it is what the self-update integrity check (mine-auto's verify-file)
+# compares a downloaded binary against — without SHA256SUMS the updater has
+# nothing to verify a download against, so this job is load-bearing, not
+# cosmetic.
+#
+# Staging mine-auto.{sh,bat} as release assets is mandatory, NOT optional: the
+# launcher self-update downloads releases/latest/download/mine-auto.{sh,bat} and
+# SHA-verifies it against SHA256SUMS. If these are not published, self-update is
+# a permanent no-op (the asset 404s / has no checksum entry).
+#
+# NOTE for the operator: before tagging, confirm src/endpoint.rs points at the
+# intended live pool. It is ALREADY set to the production endpoint (verified by
+# the pool_endpoint_decodes_to_expected test) — the binary does NOT ship a
+# placeholder; only edit it if you want to ship a different pool.
+#
+# FIRST-RUN ITERATION POINTS (these run on GitHub, not locally — watch the logs):
+#   * The CPU build is the safe one and should always succeed.
+#   * The NVIDIA build is marked continue-on-error so a failure there does NOT
+#     block the CPU release. (Once the `cuda` cargo feature + committed PTX land
+#     in the crate, this is the variant most likely to need a first-run tweak.)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Prepare dist folder
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force dist | Out-Null
+
+      - name: Build CPU (always works, no GPU deps)
+        shell: pwsh
+        run: |
+          cargo build --release
+          Copy-Item target/release/midstate-miner.exe dist/midstate-miner-windows-cpu.exe
+
+      # NVIDIA (cuda): best-effort. continue-on-error keeps the CPU release
+      # shipping even if the CUDA build is not yet wired up / fails on the runner.
+      - name: Build NVIDIA (cuda)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo build --release --features cuda
+          Copy-Item target/release/midstate-miner.exe dist/midstate-miner-windows-nvidia.exe
+
+      - name: List built artifacts
+        shell: pwsh
+        run: Get-ChildItem dist
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Prepare dist folder
+        run: mkdir -p dist
+
+      - name: Build CPU (always works, no GPU deps)
+        run: |
+          cargo build --release
+          cp target/release/midstate-miner dist/midstate-miner-linux-cpu
+
+      # NVIDIA: the CUDA backend (cudarc) dlopens the driver at runtime and JITs a
+      # committed PTX, so this build needs NO CUDA Toolkit on the runner.
+      # continue-on-error keeps CPU shipping.
+      - name: Build NVIDIA (cuda)
+        continue-on-error: true
+        run: |
+          cargo build --release --features cuda
+          cp target/release/midstate-miner dist/midstate-miner-linux-nvidia
+
+      # Publish the self-updating launchers as release assets. Existing rigs
+      # refresh them by downloading releases/latest/download/mine-auto.{sh,bat}
+      # and SHA-verifying it against the release SHA256SUMS (FAIL-CLOSED if the
+      # asset or its checksum is absent). Staging them here — in the SAME linux
+      # job whose dist/ the single release job flattens and checksums — is what
+      # makes SHA256SUMS cover them WITHOUT a second publisher racing the digests
+      # file. Without this step the launcher self-update is a permanent no-op
+      # (the asset 404s / has no checksum entry).
+      - name: Stage self-updating launchers (mine-auto.sh / mine-auto.bat)
+        run: |
+          set -euo pipefail
+          if [ -f mine-auto.sh ] && [ -f mine-auto.bat ]; then
+            cp mine-auto.sh mine-auto.bat dist/
+            echo "staged launchers:"; ls -1 dist/mine-auto.sh dist/mine-auto.bat
+          else
+            echo "::warning::mine-auto.sh / mine-auto.bat not found in repo root — self-update launchers will NOT be published this release."
+          fi
+
+      # FIX: publish a tiny version-pointer asset. The launchers resolve "latest"
+      # by GETting this over the releases/latest/download/ CDN, which is NOT
+      # subject to the unauthenticated api.github.com 60-req/hr/IP limit (the
+      # limit that silently freezes whole farms behind one public IP). Bare
+      # version, no leading 'v', single line. SHA256SUMS (generated in the
+      # release job over every dist/ file) covers it too, so a tampered
+      # version-pointer is detectable — but it only selects WHICH version to
+      # fetch; the binary itself is still SHA-verified before any swap.
+      - name: Write latest-version.txt
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          printf '%s\n' "$VER" > dist/latest-version.txt
+          echo "wrote dist/latest-version.txt ($VER)"
+
+      - name: List built artifacts
+        run: ls -la dist
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: dist/*
+          if-no-files-found: error
+
+  # Single publisher: gather every built asset, emit ONE SHA256SUMS over all of
+  # them, then publish binaries + launchers + version-pointer + SHA256SUMS
+  # together. Runs only on a tag (the build jobs still run on workflow_dispatch
+  # as a compile smoke test, but nothing is published there).
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets + generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Flatten dist-windows/ and dist-linux/ into one dist/.
+          find artifacts -type f -exec cp -t dist/ {} +
+          cd dist
+          # One checksums file over every published asset (sha256sum format:
+          # "<hex>  <filename>"), which verify-file / sha256sum -c read back.
+          # Build an explicit file list that EXCLUDES SHA256SUMS itself so the
+          # digests file can never (self-)reference a partially-written copy of
+          # itself regardless of glob/redirect ordering.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort > .asset-list
+          xargs -a .asset-list sha256sum -- > SHA256SUMS
+          rm -f .asset-list
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: false

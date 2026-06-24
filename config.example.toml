@@ -1,0 +1,61 @@
+# midstate-miner config file (optional).
+#
+# Copy this to one of these locations (first one found wins):
+#   ./config.toml                              next to where you run the miner
+#   ~/.config/midstate-miner/config.toml       Linux / macOS
+#   %APPDATA%\midstate-miner\config.toml       Windows
+# or point at it explicitly with:  --config <path>
+#
+# Every setting is OPTIONAL and mirrors a CLI flag. Precedence is:
+#   explicit CLI flag  >  this file  >  built-in default
+# so anything you pass on the command line always overrides this file.
+#
+# NOTE: this miner is POOL-ONLY and endpoint-locked. There is intentionally no
+# pool / host / url setting here or on the command line — the live pool endpoint
+# is compiled into the binary. The only thing you must provide is your payout
+# address.
+
+# ── Your Midstate payout address ─────────────────────────────────────────────
+# Set it here and you can start the miner with no --address flag.
+#
+# IMPORTANT — Midstate addresses are POST-QUANTUM, not a CSD/secp256k1 addr20.
+# A Midstate address is a 32-byte (64-hex) value derived from a *stateful*
+# Merkle-Signature-Scheme (MSS / WOTS) keypair, generated and tracked by the
+# Midstate node's own wallet (~/.midstate/wallet.dat). It is NOT an Ethereum-
+# style 20-byte secp256k1 address and CANNOT be created by this miner.
+#
+# This miner does NOT and WILL NOT generate keys for you: an MSS key is stateful
+# (each leaf may sign only once — reuse is catastrophic), so key material must
+# live in the wallet that spends it, never in a mining rig. See WALLET.md.
+#
+#   How to get your address:
+#     1. Run your Midstate node / wallet.
+#     2. Ask it for a new receiving address (e.g. the wallet's "new address" /
+#        getnewaddress command).
+#     3. Paste the 64-hex string below.
+#
+# TODO: MSS keygen / address derivation is intentionally NOT implemented in this
+#       public miner. Obtain your address from your Midstate node/wallet.
+#address = "your64charhexmidstateaddress00000000000000000000000000000000000000"
+
+# ── CPU mining threads ───────────────────────────────────────────────────────
+# cpu_threads = number of CPU worker threads to mine with.
+#   * Set 0 to DISABLE CPU mining entirely (e.g. GPU-only on a desktop, or to
+#     leave the CPU completely free).
+#   * When a GPU (CUDA) backend is ACTIVE, the miner auto-leaves 2 threads free
+#     for the OS + to feed the GPU, so you generally do NOT need to lower this by
+#     hand on a GPU rig.
+#   * Unset = use all logical cores (minus the 2 reserved when a GPU is active).
+# On the i7-12700K reference rig (8 P-cores + 4 E-cores, AVX2) a good CPU-only
+# value is 12; with the GPU active the auto -2 reservation handles it for you.
+#cpu_threads = 0
+
+# ── GPU device selection ─────────────────────────────────────────────────────
+# device = which NVIDIA GPU to mine on when the CUDA backend is active
+# (list them with: midstate-miner --address X devices). Default: 0.
+#device = 0
+
+# Launch geometry — leave unset unless you are deliberately tuning throughput.
+#blocks = 560
+#threads_per_block = 256
+#nonces_per_thread = 4096

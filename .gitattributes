@@ -6,6 +6,10 @@
 *.env   text eol=lf
 *.ptx   binary
 
+# Windows launchers/installers: CRLF so cmd.exe parses labels/goto reliably.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
 # Normal text for the rest.
 *.rs   text
 *.toml text
