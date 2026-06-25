@@ -15,7 +15,8 @@ REM  Self-updating launcher. Leave this window open.
 REM   * Runs the miner to your address. Midstate's PoW is a
 REM     SEQUENTIAL BLAKE3 chain (GPU-resistant), so a good CPU is
 REM     only a few x behind a GPU - both builds are worth running.
-REM     The nvidia build also spawns one process per GPU device.
+REM     The gpu build runs OpenCL (and, in hybrid/auto, CPU+GPU together)
+REM     in ONE process; the binary's --mode picks cpu/gpu/hybrid/auto.
 REM   * Checks GitHub for the latest release every CHECK_MIN
 REM     minutes. A new version is gated through THREE checks
 REM     before it ever runs (brick-safe hardening):
@@ -32,25 +33,56 @@ REM     binary; the rig never executes an unverified download.
 REM   * Liveness is checked on a SHORT cadence (LIVE_SEC),
 REM     decoupled from the slow update poll, with ESCALATING
 REM     BACKOFF so a crash-looping rig doesn't hammer.
-REM  Build (default cpu; nvidia for an NVIDIA GPU):
-REM     mine-auto.bat nvidia
+REM  MODE (cpu^|gpu^|hybrid^|auto, default auto) picks which build to download AND
+REM  which --mode to run. `auto` auto-detects a GPU: present -^> GPU build (runs
+REM  hybrid CPU+GPU), else the CPU build. Force a build via the first arg (cpu^|gpu):
+REM     set MODE=hybrid ^& mine-auto.bat      (GPU build, hybrid CPU+GPU)
+REM     mine-auto.bat cpu                     (force the CPU build)
 REM
 REM  Env knobs (all optional):
+REM     MODE          cpu ^| gpu ^| hybrid ^| auto       (default auto)
 REM     CHECK_MIN     update-poll period in minutes      (default 15)
 REM     LIVE_SEC      liveness-check period in seconds    (default 30)
 REM     MAX_RESTARTS  rapid restarts before backing off   (default 5)
-REM     MIDSTATE_GPU_IDS  comma list of GPU ids to mine, e.g
-REM                   "0,2" to skip card 1 (default: all cards,
-REM                   nvidia build only)
 REM     MIDSTATE_ON_CRASH  path to a .bat run once when the
 REM                   restart cap is hit (driver reset, etc.)
 REM ============================================================
 
 set "REPO=dangraagu/DGR-Midstate-pool-Public"
+
+REM --- MODE + build-variant resolution --------------------------------------
+REM MODE drives the binary's --mode AND which build we download. Default auto.
+if not defined MODE set "MODE=auto"
+if /i not "%MODE%"=="cpu" if /i not "%MODE%"=="gpu" if /i not "%MODE%"=="hybrid" if /i not "%MODE%"=="auto" (
+  echo [X] Unknown MODE "%MODE%". Use one of: cpu ^| gpu ^| hybrid ^| auto
+  pause & exit /b 1
+)
+
+REM Which BUILD to fetch: first arg wins (cpu^|gpu); else derive from MODE; for
+REM auto, detect an NVIDIA/OpenCL GPU and pick the gpu build if present. The gpu
+REM build still runs CPU-only if no device is found at runtime (degrades), and the
+REM updater falls back to the cpu asset if the gpu asset is missing - never a brick.
 set "VARIANT=%~1"
-if not defined VARIANT set "VARIANT=cpu"
+if not defined VARIANT (
+  if /i "%MODE%"=="cpu" ( set "VARIANT=cpu"
+  ) else if /i "%MODE%"=="gpu" ( set "VARIANT=gpu"
+  ) else if /i "%MODE%"=="hybrid" ( set "VARIANT=gpu"
+  ) else (
+    REM auto: probe for a GPU (NVIDIA name match is a good proxy; any GPU vendor
+    REM with an OpenCL ICD also works at runtime). Default cpu on no/false detect.
+    set "VARIANT=cpu"
+    for /f "usebackq delims=" %%g in (`powershell -NoProfile -Command "$n=((Get-CimInstance Win32_VideoController).Name -join ','); if ($n -match 'NVIDIA|AMD|Radeon|Intel\(R\) Arc'){'gpu'} else {'cpu'}"`) do set "VARIANT=%%g"
+  )
+)
+REM Back-compat: an old caller passing 'nvidia' maps to the gpu build.
+if /i "%VARIANT%"=="nvidia" set "VARIANT=gpu"
+if /i not "%VARIANT%"=="cpu" if /i not "%VARIANT%"=="gpu" (
+  echo [X] Unknown build "%VARIANT%". Use one of: gpu ^| cpu
+  pause & exit /b 1
+)
+
 set "DIR=%LOCALAPPDATA%\midstate-miner"
-if /i "%VARIANT%"=="cpu" ( set "EXE=midstate-miner.exe" ) else ( set "EXE=midstate-miner-%VARIANT%.exe" )
+if /i "%VARIANT%"=="cpu" ( set "EXE=midstate-miner.exe" ) else ( set "EXE=midstate-miner-gpu.exe" )
 set "BIN=%DIR%\%EXE%"
 set "CFG=%DIR%\address.txt"
 if not defined CHECK_MIN set "CHECK_MIN=15"
@@ -90,30 +122,11 @@ if not defined ADDR (
 )
 if not defined ADDR ( echo [X] No address entered. & pause & exit /b 1 )
 
-REM --- which GPU device indices to mine (nvidia build only) ---
-REM Default: one process per detected card (0 .. NGPU-1). If MIDSTATE_GPU_IDS is set
-REM (e.g. "0,2"), mine exactly those indices instead (skip a bad card). The cpu
-REM build is single-process (no device index).
-set "GPU_ARG="
-set "DEVLIST=0"
-if /i not "%VARIANT%"=="cpu" (
-  if defined MIDSTATE_GPU_IDS (
-    set "DEVLIST=%MIDSTATE_GPU_IDS%"
-    set "GPU_ARG=--gpu-id %MIDSTATE_GPU_IDS%"
-    echo Using MIDSTATE_GPU_IDS filter: mining devices %MIDSTATE_GPU_IDS%.
-  ) else (
-    set "NGPU="
-    for /f "usebackq delims=" %%n in (`powershell -NoProfile -Command "$g=@((Get-CimInstance Win32_VideoController).Name); $c=0; foreach($n in $g){ if($n -match 'NVIDIA'){$c++} }; $c"`) do set "NGPU=%%n"
-    if not defined NGPU set "NGPU=1"
-    if !NGPU! LSS 1 set "NGPU=1"
-    REM Build a space-separated device list 0 1 2 ... NGPU-1.
-    set "DEVLIST="
-    set /a LAST=!NGPU!-1
-    for /l %%i in (0,1,!LAST!) do set "DEVLIST=!DEVLIST! %%i"
-    echo Rig has !NGPU! GPU(s).
-  )
-)
-echo Mining to !ADDR!.
+REM The v0.1.1 binary handles ALL hardware itself: --mode picks cpu/gpu/hybrid/auto,
+REM the OpenCL backend drives every GPU device, and the hybrid backend runs CPU+GPU
+REM concurrently in ONE process. So there is no per-card fan-out and no
+REM --device/--gpu-id/--log-dir here (the binary does not take those).
+echo Mining to !ADDR! (mode=%MODE%, build=%VARIANT%).
 echo Auto-checking GitHub for updates every %CHECK_MIN% min (liveness every %LIVE_SEC%s). Keep this open.
 echo(
 
@@ -314,6 +327,10 @@ if not !errorlevel!==0 (
     set "EXE=midstate-miner.exe"
     set "BIN=%DIR%\midstate-miner.exe"
     set "NEWBIN=%DIR%\midstate-miner.exe.new"
+    REM The CPU binary rejects --mode gpu/hybrid; downgrade an explicit GPU mode to
+    REM auto so the fallback rig mines on CPU instead of erroring on every start.
+    if /i "%MODE%"=="gpu" set "MODE=auto"
+    if /i "%MODE%"=="hybrid" set "MODE=auto"
     if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
     curl -L -f -o "!NEWBIN!" "https://github.com/%REPO%/releases/latest/download/midstate-miner.exe"
     if not !errorlevel!==0 (
@@ -399,6 +416,13 @@ move /Y "!NEWBIN!" "%BIN%" >nul
 if not !errorlevel!==0 (
   echo [%time%] [X] could not swap in the new binary; keeping current.
   if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
+  REM NO-STRAND: we already taskkill'd the running miner above, so a failed swap
+  REM would leave the rig IDLE and re-fire this same failing update every poll
+  REM (kill -^> idle -^> kill ...). Bring the OLD binary back up immediately on the
+  REM existing %BIN% before bailing, mirroring mine-auto.sh's failed-update branch
+  REM (`[ "$INSTALLED" != "none" ] && start_miners`). Only restart once we have an
+  REM installed build (skip on a never-yet-installed first poll).
+  if not "!INSTALLED!"=="none" call :start_miners
   goto :eof
 )
 set "INSTALLED=!LATEST!"
@@ -517,13 +541,11 @@ if !errorlevel!==0 (
 goto :eof
 
 :start_miners
-REM cpu build: a single process (no device index). nvidia build: one process per
-REM device index in DEVLIST, each to the same address.
-if /i "%VARIANT%"=="cpu" (
-  start "Midstate miner (!INSTALLED!)" "%BIN%" --address !ADDR! --log-dir "%DIR%\cpu-log"
-) else (
-  for %%i in (!DEVLIST!) do start "Midstate miner GPU %%i (!INSTALLED!)" "%BIN%" --address !ADDR! --device %%i !GPU_ARG! --log-dir "%DIR%\gpu%%i-log"
-)
+REM ONE process per rig. The binary handles all hardware via --mode (cpu/gpu/
+REM hybrid/auto): the OpenCL backend drives every GPU device and the hybrid
+REM backend runs CPU+GPU concurrently in-process. No --device/--gpu-id/--log-dir
+REM (the v0.1.1 binary does not accept those).
+start "Midstate miner (!INSTALLED!, %MODE%/%VARIANT%)" "%BIN%" --address !ADDR! --mode %MODE%
 goto :eof
 
 :run_crash_hook

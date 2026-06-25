@@ -3,13 +3,12 @@
 A friendly, copy-pasteable walkthrough for mining on the Midstate pool with the
 open-source `midstate-miner`.
 
-> **Honest status (early development):** There is **no prebuilt binary and no
-> published release yet.** The one-click installer and the auto-updating
-> launcher exist in the repo but are **inert today** — they try to download a
-> release that doesn't exist. The **only working way to mine right now is to
-> build from source** (`cargo build --release`) and run the binary with your
-> payout address. This guide tells you exactly how, and is careful not to
-> promise anything that isn't actually wired up yet.
+> **Status (v0.1.1):** Prebuilt, SHA-256-verified binaries ship for Windows,
+> Linux, and macOS via [GitHub Releases](https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/latest).
+> The easiest path is the **one-click installer + self-updating launcher**
+> (section 9); building from source (sections 4–5) still works and is great for
+> auditing. Either way, the only thing you provide is your payout address. Early
+> software — treat mining as experimental.
 
 ---
 
@@ -98,9 +97,10 @@ your authorization (see Troubleshooting).
 
 ---
 
-## 4. Build (there's no prebuilt binary yet)
+## 4. Build from source (optional — prebuilt binaries also ship)
 
-There is no published release and nothing to download. Build it yourself:
+Prebuilt release binaries exist (section 9 is the easy path), but building it
+yourself is fully supported and ideal for auditing. CPU build:
 
 ```sh
 # CPU-only release build (the normal path — no GPU toolchain required)
@@ -158,10 +158,10 @@ These are **all** the flags the current binary accepts. Every flag is
 | `--version` / `-V` | *(built-in)* | Print the version. |
 
 > **Note on the "minus 2" rule:** the help text for `--cpu-threads` mentions
-> "minus 2 if a GPU also mines." That reservation is implemented and tested, but
-> in **today's** binary it does **not** fire — a default CPU run uses **all**
-> physical cores. The minus-2 behaviour only activates in the future GPU+CPU
-> hybrid (not wired up yet). See section 7.
+> "minus 2 if a GPU also mines." That reservation is for the **hybrid** path
+> (`--mode hybrid`/`auto` on the GPU build), which leaves a couple of cores free
+> for GPU feeding. A plain **CPU run uses all physical cores** — the reservation
+> doesn't apply when no GPU is mining alongside. See section 7.
 
 ### Copy-paste example
 
@@ -251,28 +251,30 @@ you otherwise.
 
 By default the miner uses **all** your physical cores. `--cpu-threads N` lets you
 dial that **down** (it's clamped to the core count — you can ask for fewer, never
-more). The "leave 2 cores free when a GPU is also mining" rule exists in the code
-and is unit-tested, but it is **not active in today's binary** (the live path
-always runs with no GPU, so it uses every core). It will matter only once the
-GPU+CPU hybrid ships.
+more). The "leave 2 cores free when a GPU is also mining" rule applies on the
+**hybrid** path (CPU+GPU together), so the CPU side doesn't starve GPU feeding; a
+plain CPU run (no GPU mining alongside) uses every core.
 
-### GPU — opt-in and in progress (not ready today)
+### GPU — OpenCL, opt-in build / shipped release binary
 
-Be clear-eyed about GPU status:
+Where GPU stands:
 
-- **The default build is CPU-only.** GPU support is **opt-in at build time**, and
-  there is **no released GPU binary of any kind.**
-- **OpenCL** is the only GPU backend that has code today. To try it you must
-  build it yourself with `cargo build --release --features opencl` **and** have a
-  working OpenCL driver/ICD installed. If present, the miner auto-selects the GPU;
-  `--cpu` forces CPU instead. Note: OpenCL bit-exactness has so far been verified
-  only on POCL (a CPU OpenCL implementation), not validated on real GPU hardware,
-  so treat it as experimental.
-- **CUDA / NVIDIA** is **not available.** There is no `cuda` feature in the build
-  config, the CUDA backend is unimplemented, and the project describes it as a
-  "next milestone." Anything you see referring to NVIDIA builds is forward-looking.
+- **OpenCL** is the GPU backend. A prebuilt GPU release binary ships per OS
+  (`midstate-miner-gpu.exe`, `midstate-miner-<os>-gpu`); the installer grabs it
+  automatically when it detects a GPU. To build it yourself, use
+  `cargo build --release --features opencl`. You need a working OpenCL driver/ICD
+  for your GPU at runtime; OpenCL drives **NVIDIA, AMD, and Intel** GPUs.
+- **Run mode** is `--mode cpu|gpu|hybrid|auto` (default `auto`): `gpu` uses the
+  GPU, `hybrid` runs CPU+GPU together in one process, and `auto` uses a GPU if one
+  is present and **degrades gracefully to CPU** if not. The default CPU build
+  ignores GPU modes and always mines on CPU.
+- **No CUDA backend.** GPU acceleration is OpenCL-only by design (one backend that
+  covers all vendors). Treat GPU bit-exactness as still-maturing — it's been
+  validated against the golden vectors on POCL (a CPU OpenCL implementation); if
+  you hit a GPU-specific reject pattern, fall back to `--mode cpu` and report it.
 
-**Bottom line: today, mine on CPU.** GPU is coming later.
+**Bottom line:** CPU is the proven floor and is genuinely competitive here; the
+OpenCL GPU/hybrid build ships too — `auto` picks the right one for your box.
 
 ---
 
@@ -293,31 +295,61 @@ Be clear-eyed about GPU status:
 
 ---
 
-## 9. The one-click launcher (`mine-auto`) — accurate status
+## 9. The one-click launcher (`mine-auto`) — the supported path
 
-The repo ships `install-midstate-miner.bat` / `.sh` (installers) and
+The repo ships `install-midstate-miner.bat` / `.sh` (one-click installers) and
 `mine-auto.bat` / `.sh` (a self-updating supervisor that restarts dead miners and
-checks for new versions with SHA-256 verification). They're designed to be the
-eventual plug-and-play path.
+pulls new versions). **These are the supported, recommended way to mine** — they
+download the prebuilt release binary for your OS, verify it, and keep it current.
+The build-from-source path in sections 4–5 still works and is great for auditing,
+but for a 24/7 rig the launchers are the easy path.
 
-**They do not work yet, and you should not rely on them today.** Here's why,
-plainly:
+**What the installer does (`install-midstate-miner.{bat,sh}`):**
 
-- Every download they perform points at this repo's GitHub **Releases**
-  (`releases/latest/download/…`). **No release has been published** — no tags
-  exist — so those URLs 404.
-- The installer will print **`[X] Download failed. Either no release is
-  published yet…`** and stop. The auto-updater finds no version file and simply
-  no-ops (it keeps quiet rather than breaking anything).
-- The launcher scripts are also written **ahead of the binary**: they invoke
-  flags and subcommands (`--device`, `--gpu-id`, `--log-dir`, `check-update`,
-  `verify-file`) that the **current** binary does not have. Running today's
-  freshly-built binary through them would fail on unknown arguments.
+1. Detects a GPU (else falls back to CPU) and picks the matching build — override
+   with a `gpu` / `cpu` argument.
+2. Downloads that binary from this repo's GitHub **Releases**
+   (`releases/latest/download/…`).
+3. **Verifies it against the release `SHA256SUMS`** using the OS hashing tool —
+   `sha256sum`/`shasum` on Linux/macOS, `Get-FileHash` on Windows — and **fails
+   closed**: a missing checksums file, an unlisted asset, no available verifier,
+   or a hash mismatch deletes the download and aborts. Nothing is running yet, so
+   an abort can never strand a rig.
+4. Asks for your payout address once (saved for next time).
+5. Hands off to `mine-auto` to start mining and keep itself updated.
 
-**So: skip the launcher for now and use the build-from-source + `--address`
-path from sections 4–5.** Once a signed release is published, the installer and
-auto-updater become the easy path (download → verify SHA-256 → run → keep
-itself updated). Until then, they're inert by design.
+**What the auto-updater does (`mine-auto.{bat,sh}`):**
+
+- Restarts the miner if it dies, with escalating backoff on a crash loop (so a
+  flapping rig is not hammered).
+- Polls GitHub for a newer release every `CHECK_MIN` minutes (default 15) via a
+  CDN-served `latest-version.txt` (not the rate-limited API).
+- On a new version: downloads to a **temp path** (never over the live binary),
+  **SHA-256-verifies** it against `SHA256SUMS` with the OS tool, and only then
+  does an **atomic swap** and restart. Any failure keeps the working binary
+  running — the rig never executes an unverified download and is never left idle
+  by a failed update.
+- The launcher can also refresh **itself** the same way (download → verify →
+  staged atomic swap on the next start), so a launcher-side fix reaches the fleet.
+
+**Run mode** is passed through to the binary as `--mode` (`cpu|gpu|hybrid|auto`,
+default `auto`). Set it via the environment before launching:
+
+```sh
+# Linux/macOS — hybrid (CPU+GPU together), check for updates every 10 min
+MODE=hybrid CHECK_MIN=10 ./mine-auto.sh
+```
+
+```bat
+REM Windows — force the CPU build/mode
+set MODE=cpu & mine-auto.bat cpu
+```
+
+The miner takes only the real flags from section 5 (`--address`, `--mode`,
+`--cpu-threads`, `--cpu`, `--share-bits`, `--duration`); the launchers drive it
+with `--address` and `--mode` and nothing exotic. There are no `--device`,
+`--gpu-id`, or `--log-dir` flags — one process handles all hardware via `--mode`,
+and the OpenCL/hybrid backends drive every GPU device in-process.
 
 ---
 
@@ -332,7 +364,7 @@ itself updated). Until then, they're inert by design.
 | Quiet after `authorize: true` (no jobs, no heartbeat) | The pool simply has no work for you yet. | **Not a bug.** The heartbeat only ticks while mining a job. Wait — `job …` lines appear when the pool sends work. |
 | `0 CPU threads after budget — nothing to mine` | You passed `--cpu-threads 0` (or the budget resolved to zero). | Give it at least 1 thread, or omit `--cpu-threads` to use all cores. |
 | "Slow hashrate" / feels slow | It's a sequential 1,000,000-iteration VDF on CPU — this is expected (section 7). | Use more threads (default already uses all cores), or wait for the GPU backend. Don't expect GPU-class throughput from a CPU. |
-| Unknown-argument errors when starting | You ran the binary through `mine-auto` or copied launcher flags. | Use the bare `--address` invocation (section 5). The launcher's `--device`/`--gpu-id`/`--log-dir` flags don't exist in today's binary. |
+| Unknown-argument errors when starting | You passed a flag the binary doesn't have (e.g. an old `--device`/`--gpu-id`/`--log-dir` copied from somewhere). | Use only the section-5 flags (`--address`, `--mode`, `--cpu-threads`, `--cpu`, `--share-bits`, `--duration`). The installer/`mine-auto` launchers only ever pass `--address` and `--mode`, so they won't trigger this. |
 
 ---
 
@@ -363,8 +395,10 @@ development; treat mining as experimental.
 The PoW is a sequential VDF, which limits the advantage of parallel hardware
 (section 7).
 
-**Where's the GPU/NVIDIA version?**
-Not ready. CPU is the path today (sections 7 and 9).
+**Where's the GPU version?**
+It ships: an OpenCL GPU build is published per OS and the installer auto-selects
+it when a GPU is detected (use `--mode gpu|hybrid|auto`). OpenCL covers NVIDIA,
+AMD, and Intel — there's no separate CUDA build. See sections 7 and 9.
 
 ---
 

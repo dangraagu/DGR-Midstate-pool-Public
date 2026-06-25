@@ -1,20 +1,27 @@
 name: release
 
-# Builds the default (CPU) Midstate miner binary for Windows + Linux + macOS and
-# publishes them to a GitHub Release, together with the self-updating launchers,
-# a version-pointer, and a SHA256SUMS file the launchers verify every download
+# Builds the Midstate miner for Windows + Linux + macOS — BOTH a CPU-only binary
+# (default features) and a GPU/hybrid binary (--features opencl) per OS — and
+# publishes them to a GitHub Release together with the self-updating launchers, a
+# version-pointer, and a SHA256SUMS file the launchers verify every download
 # against.
 #
 # Triggers:
 #   * push a tag  v*   -> build every OS AND publish them to the release
 #   * workflow_dispatch -> build only (smoke-test that everything compiles)
 #
-# Backends: only the DEFAULT (CPU) build is published. The miner's PoW is a
-# SEQUENTIAL BLAKE3 chain (GPU-resistant), so the toolkit-free CPU build is the
-# product. There is intentionally NO cuda variant (no such cargo feature exists)
-# and NO opencl variant (opencl is a self-build per docs/MINING-GUIDE.md). If a
-# GPU backend is wired up later, add its job + asset name here AND the matching
-# launcher download name in the SAME change.
+# Backends:
+#   * CPU build  (default features)  — toolkit-free, runs anywhere. The product
+#     floor; the miner's PoW is a SEQUENTIAL BLAKE3 chain so CPU is competitive.
+#   * GPU build  (--features opencl) — adds the OpenCL GPU backend and the hybrid
+#     (CPU+GPU concurrent) backend. Selected by `--mode gpu|hybrid|auto`. It
+#     DEGRADES GRACEFULLY at runtime: if no OpenCL device/ICD is present, `auto`
+#     falls back to CPU (and `gpu`/`hybrid` print a clear error), so shipping the
+#     GPU binary to a GPU-less box never crashes it.
+#   Each GPU job installs that OS's OpenCL build deps:
+#     - ubuntu:  ocl-icd-opencl-dev (the ICD loader + headers)
+#     - windows: the OpenCL SDK headers+lib via vcpkg (opencl)
+#     - macOS:   the system OpenCL.framework (already present; no install)
 #
 # ────────────────────────────────────────────────────────────────────────────
 # ASSET-NAME CONTRACT (the load-bearing invariant)
@@ -25,9 +32,12 @@ name: release
 # basename, and FAIL CLOSED if either the asset or its checksum line is absent.
 # So these names are NOT free to change without changing the launchers too:
 #
-#   midstate-miner.exe        Windows CPU  (mine-auto.bat / install-midstate-miner.bat: EXE=midstate-miner.exe)
-#   midstate-miner-linux      Linux   CPU  (mine-auto.sh  / install-midstate-miner.sh:  BIN_NAME=midstate-miner-linux)
+#   midstate-miner.exe        Windows CPU  (mine-auto.bat / install-*.bat: EXE=midstate-miner.exe)
+#   midstate-miner-gpu.exe    Windows GPU  (mine-auto.bat / install-*.bat: EXE=midstate-miner-gpu.exe)
+#   midstate-miner-linux      Linux   CPU  (mine-auto.sh  / install-*.sh:  BIN_NAME=midstate-miner-linux)
+#   midstate-miner-linux-gpu  Linux   GPU  (mine-auto.sh  / install-*.sh:  BIN_NAME=midstate-miner-linux-gpu)
 #   midstate-miner-macos      macOS   CPU  (mine-auto.sh on Darwin: BIN_NAME=midstate-miner-macos)
+#   midstate-miner-macos-gpu  macOS   GPU  (mine-auto.sh on Darwin: BIN_NAME=midstate-miner-macos-gpu)
 #   mine-auto.sh / mine-auto.bat           (self-updating launchers; SHA-verified self-update)
 #   latest-version.txt                     (bare version string, CDN-served so the
 #                                           launchers resolve "latest" WITHOUT the
@@ -86,6 +96,24 @@ jobs:
           cargo build --release
           Copy-Item target/release/midstate-miner.exe dist/midstate-miner.exe
 
+      # GPU/hybrid build (--features opencl). Install the OpenCL SDK (headers + the
+      # OpenCL.lib import library the linker needs) via vcpkg, which is preinstalled
+      # on windows-latest. The ICD loader (OpenCL.dll) ships with the GPU driver on
+      # the user's machine; we only need the SDK to LINK here.
+      - name: Install OpenCL SDK (vcpkg)
+        shell: pwsh
+        run: |
+          vcpkg install opencl:x64-windows
+          # Expose the import lib to the linker for the opencl-sys build.
+          "OPENCL_ROOT=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIB=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build GPU (opencl)
+        shell: pwsh
+        run: |
+          cargo build --release --features opencl
+          Copy-Item target/release/midstate-miner.exe dist/midstate-miner-gpu.exe
+
       - name: List built artifacts
         shell: pwsh
         run: Get-ChildItem dist
@@ -114,6 +142,19 @@ jobs:
         run: |
           cargo build --release
           cp target/release/midstate-miner dist/midstate-miner-linux
+
+      # GPU/hybrid build (--features opencl). ocl-icd-opencl-dev provides the ICD
+      # loader (libOpenCL.so) + headers to link against. The runtime ICD for the
+      # user's actual GPU ships with their driver; this only satisfies the linker.
+      - name: Install OpenCL build deps (ubuntu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocl-icd-opencl-dev
+
+      - name: Build GPU (opencl)
+        run: |
+          cargo build --release --features opencl
+          cp target/release/midstate-miner dist/midstate-miner-linux-gpu
 
       # Publish the self-updating launchers as release assets. Existing rigs
       # refresh them by downloading releases/latest/download/mine-auto.{sh,bat}
@@ -181,6 +222,14 @@ jobs:
           cargo build --release
           cp target/release/midstate-miner dist/midstate-miner-macos
 
+      # GPU/hybrid build (--features opencl). macOS ships the OpenCL framework
+      # system-wide; opencl-sys links -framework OpenCL with NO extra install.
+      # (Apple deprecated OpenCL but it still links + runs on current macOS.)
+      - name: Build GPU (opencl)
+        run: |
+          cargo build --release --features opencl
+          cp target/release/midstate-miner dist/midstate-miner-macos-gpu
+
       - name: List built artifacts
         run: ls -la dist
 
@@ -218,8 +267,9 @@ jobs:
           # digests file can never (self-)reference a partially-written copy of
           # itself regardless of glob/redirect ordering. The filename field here
           # is the EXACT basename the launchers look up (midstate-miner.exe,
-          # midstate-miner-linux, midstate-miner-macos, mine-auto.sh, ...), which
-          # is what makes upload == download == SHA256SUMS key.
+          # midstate-miner-gpu.exe, midstate-miner-linux, midstate-miner-linux-gpu,
+          # midstate-miner-macos, midstate-miner-macos-gpu, mine-auto.sh, ...),
+          # which is what makes upload == download == SHA256SUMS key.
           find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort > .asset-list
           xargs -a .asset-list sha256sum -- > SHA256SUMS
           rm -f .asset-list

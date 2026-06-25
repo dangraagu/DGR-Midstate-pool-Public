@@ -10,9 +10,10 @@ set -euo pipefail
 #    2. Download the matching prebuilt miner from GitHub Releases.
 #    3. Ask for your Midstate payout address once (and remember it).
 #    4. Start mining to the pool.
-#  Override detection:  ./install-midstate-miner.sh nvidia|cpu
-#  GPU DRIVERS ARE NOT INSTALLED HERE - the nvidia build needs your
-#  NVIDIA driver/runtime already present; otherwise use the cpu build.
+#  Override detection:  ./install-midstate-miner.sh gpu|cpu
+#  Set MODE=cpu|gpu|hybrid|auto to choose the run mode (default auto).
+#  GPU DRIVERS ARE NOT INSTALLED HERE - the gpu build needs your GPU's
+#  OpenCL runtime/driver already present; otherwise use the cpu build.
 #
 #  Running via  curl ... | bash  (no terminal)? There is no TTY to
 #  prompt on, so pass your address in the environment:
@@ -53,29 +54,43 @@ download() {
 }
 
 # --- 1. Pick the build variant (arg overrides auto-detect) -----------------
+# A GPU (NVIDIA, or any vendor with an OpenCL ICD) selects the gpu build
+# (OpenCL/hybrid). The gpu build still runs CPU-only at runtime if no device is
+# found. MODE (default auto) is passed through to mine-auto.sh at the end.
+MODE="${MODE:-auto}"
+case "$MODE" in
+  cpu|gpu|hybrid|auto) ;;
+  *) echo "[X] Unknown MODE '$MODE'. Use one of: cpu | gpu | hybrid | auto" >&2; exit 1 ;;
+esac
+
 VARIANT="${1:-}"
 if [ -z "$VARIANT" ]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-    VARIANT="nvidia"
+    VARIANT="gpu"
+  elif command -v clinfo >/dev/null 2>&1 && clinfo 2>/dev/null | grep -qi 'Device Name'; then
+    VARIANT="gpu"
+  elif ls /etc/OpenCL/vendors/*.icd >/dev/null 2>&1; then
+    VARIANT="gpu"
   else
     VARIANT="cpu"
   fi
 fi
 
 case "$VARIANT" in
-  nvidia|cpu) ;;
+  gpu|cpu) ;;
+  nvidia) VARIANT="gpu" ;;  # back-compat alias
   *)
-    echo "[X] Unknown build '$VARIANT'. Use one of: nvidia | cpu" >&2
+    echo "[X] Unknown build '$VARIANT'. Use one of: gpu | cpu" >&2
     exit 1
     ;;
 esac
-echo "Selected build: $VARIANT"
+echo "Selected build: $VARIANT  (mode=$MODE)"
 
 # Print the relevant prerequisite hint.
 case "$VARIANT" in
-  nvidia)
-    echo "  -> NVIDIA build: needs a recent NVIDIA driver (CUDA links at runtime;"
-    echo "     no CUDA toolkit install needed). Check with: nvidia-smi"
+  gpu)
+    echo "  -> GPU build: needs an OpenCL runtime/ICD for your GPU (NVIDIA driver,"
+    echo "     AMD/Intel OpenCL, etc.). Runs CPU-only if no device is found."
     ;;
   cpu)
     echo "  -> CPU build: no GPU or driver required. Midstate's sequential BLAKE3"
@@ -92,7 +107,7 @@ esac
 if [ "$VARIANT" = "cpu" ]; then
   BIN_NAME="midstate-miner-$PLATFORM"
 else
-  BIN_NAME="midstate-miner-linux-$VARIANT"
+  BIN_NAME="midstate-miner-$PLATFORM-gpu"
 fi
 BIN="$DATA_DIR/$BIN_NAME"
 URL="https://github.com/$REPO/releases/latest/download/$BIN_NAME"
@@ -151,10 +166,17 @@ echo "  -> verified ($WANT)."
 chmod +x "$BIN"
 
 # --- 2b. Also fetch the auto-update launcher next to this file -------------
+# Fetch mine-auto.sh from the RELEASE ASSET, NOT raw.githubusercontent main. The
+# release asset is the SHA-covered artifact (listed in SHA256SUMS) that
+# mine-auto.sh's own launcher self-update pulls, so a fresh install and a later
+# self-update converge on identical, verified bytes — instead of installing the
+# unverified raw-main blob on the first fetch. Fail-closed: download() returns
+# non-zero on any failure and we only chmod on success (a failed fetch leaves no
+# launcher; the hand-off below then falls back to running the verified binary).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Fetching the auto-update launcher ..."
 for f in mine-auto.sh; do
-  if download "https://raw.githubusercontent.com/$REPO/main/$f" "$SCRIPT_DIR/$f" 2>/dev/null; then
+  if download "https://github.com/$REPO/releases/latest/download/$f" "$SCRIPT_DIR/$f" 2>/dev/null; then
     chmod +x "$SCRIPT_DIR/$f" 2>/dev/null || true
   fi
 done
@@ -214,10 +236,12 @@ echo "Press Ctrl+C to stop."
 echo
 
 MINE_AUTO="$SCRIPT_DIR/mine-auto.sh"
+# Export MODE so it survives the exec into the launcher (which reads $MODE).
+export MODE
 if [ -x "$MINE_AUTO" ] || [ -f "$MINE_AUTO" ]; then
   # FAIL-SAFE: if the self-updating launcher can't start for any reason, fall
   # back to running the binary we just installed+verified so the rig still mines.
-  exec bash "$MINE_AUTO" "$VARIANT" || exec "$BIN" --address "$ADDR"
+  exec bash "$MINE_AUTO" "$VARIANT" || exec "$BIN" --address "$ADDR" --mode "$MODE"
 else
   echo "[!] mine-auto.sh not found next to the installer; running the installed"
   echo "    binary directly (no auto-update). Re-download mine-auto.sh for 24/7 rigs."

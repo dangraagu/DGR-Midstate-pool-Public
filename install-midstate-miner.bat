@@ -13,9 +13,10 @@ REM    2. Install the Microsoft VC++ runtime via winget if missing.
 REM    3. Download the matching prebuilt miner from GitHub Releases.
 REM    4. Ask for your Midstate payout address once (and remember it).
 REM    5. Start mining to the pool.
-REM  Override detection:  install-midstate-miner.bat nvidia ^| cpu
-REM  GPU drivers are NOT installed here - the nvidia build needs your
-REM  NVIDIA driver already present; otherwise use the cpu build.
+REM  Override detection:  install-midstate-miner.bat gpu ^| cpu
+REM  Set MODE=cpu^|gpu^|hybrid^|auto to choose the run mode (default auto).
+REM  GPU drivers are NOT installed here - the gpu build needs your GPU's
+REM  OpenCL runtime/driver already present; otherwise use the cpu build.
 REM ============================================================
 
 set "REPO=dangraagu/DGR-Midstate-pool-Public"
@@ -28,16 +29,22 @@ echo  === Midstate Pool Miner installer ===
 echo(
 
 REM --- 1. Pick the build variant (arg overrides auto-detect) ---
+REM A GPU (NVIDIA/AMD/Intel Arc) selects the gpu build (OpenCL/hybrid). The gpu
+REM build still runs CPU-only at runtime if no OpenCL device is found. MODE
+REM (default auto) is passed through to mine-auto.bat at the end.
+if not defined MODE set "MODE=auto"
 set "VARIANT=%~1"
 if not defined VARIANT (
   REM Pipe-free PowerShell (no '|' to mis-escape inside the for/f backticks):
-  REM use .Name instead of "| Select-Object". NVIDIA -> nvidia, else cpu.
-  for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$n=((Get-CimInstance Win32_VideoController).Name -join ','); if ($n -match 'NVIDIA'){'nvidia'} else {'cpu'}"`) do set "VARIANT=%%i"
+  REM use .Name instead of "| Select-Object". A GPU vendor -> gpu, else cpu.
+  for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$n=((Get-CimInstance Win32_VideoController).Name -join ','); if ($n -match 'NVIDIA|AMD|Radeon|Intel\(R\) Arc'){'gpu'} else {'cpu'}"`) do set "VARIANT=%%i"
 )
 if not defined VARIANT set "VARIANT=cpu"
-echo Selected build: %VARIANT%
+REM Back-compat: an old 'nvidia' arg maps to the gpu build.
+if /i "%VARIANT%"=="nvidia" set "VARIANT=gpu"
+echo Selected build: %VARIANT%  (mode=%MODE%)
 
-if /i "%VARIANT%"=="cpu" ( set "EXE=midstate-miner.exe" ) else ( set "EXE=midstate-miner-%VARIANT%.exe" )
+if /i "%VARIANT%"=="cpu" ( set "EXE=midstate-miner.exe" ) else ( set "EXE=midstate-miner-gpu.exe" )
 set "BIN=%DIR%\%EXE%"
 set "URL=https://github.com/%REPO%/releases/latest/download/%EXE%"
 
@@ -86,8 +93,19 @@ REM its 64-hex digest.
 echo Verifying %EXE% against the release SHA256SUMS ...
 set "WANT="
 set "SUMS=%DIR%\SHA256SUMS.install"
+set "SUMS_URL=https://github.com/%REPO%/releases/latest/download/SHA256SUMS"
 if exist "!SUMS!" del /f /q "!SUMS!" >nul 2>&1
-curl -L -f -s -o "!SUMS!" "https://github.com/%REPO%/releases/latest/download/SHA256SUMS" >nul 2>&1
+REM Fetch SHA256SUMS with the SAME curl-then-PowerShell fallback the binary
+REM download uses, so a Windows box WITHOUT curl can still verify (a no-curl box
+REM would otherwise false-fail with an empty WANT). Still FAIL-CLOSED: if neither
+REM tool produces the file, !SUMS! is absent, WANT stays empty, and the guard
+REM below aborts + deletes the unverified binary.
+where curl >nul 2>&1
+if !errorlevel!==0 (
+  curl -L -f -s -o "!SUMS!" "!SUMS_URL!" >nul 2>&1
+) else (
+  powershell -NoProfile -Command "try { Invoke-WebRequest -Uri '!SUMS_URL!' -OutFile '!SUMS!' -UseBasicParsing } catch { exit 1 }" >nul 2>&1
+)
 if exist "!SUMS!" (
   for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "$a='%EXE%'; $h=''; foreach($ln in (Get-Content -LiteralPath '!SUMS!')){ $p=@($ln -split '\s+' ^| Where-Object { $_ -ne '' }); if($p.Count -ge 2 -and ($p[1] -eq $a -or $p[1] -eq ('*'+$a)) -and $p[0] -match '^[0-9A-Fa-f]{64}$'){ $h=$p[0]; break } }; $h"`) do set "WANT=%%a"
   del /f /q "!SUMS!" >nul 2>&1
@@ -119,12 +137,20 @@ if /i not "!GOT!"=="!WANT!" (
 echo   -^> verified ^(!WANT!^).
 
 REM --- 3b. Also fetch the auto-update launcher next to this file ---
+REM Fetch mine-auto.bat from the RELEASE ASSET, NOT raw.githubusercontent main.
+REM The raw main blob is the committed file, which .gitattributes stores LF-only
+REM (`*.bat text eol=crlf` only normalises on the runner/working-tree, not the raw
+REM API blob) - a freshly-installed rig would then run an LF .bat until its first
+REM self-update. The release asset is CRLF (staged from the runner working tree),
+REM SHA-covered by SHA256SUMS, and is the EXACT same artifact mine-auto.bat's own
+REM self-update path pulls - so install and self-update converge on identical bytes.
+set "MINEAUTO_URL=https://github.com/%REPO%/releases/latest/download/mine-auto.bat"
 echo Fetching the auto-update launcher ...
 where curl >nul 2>&1
 if !errorlevel!==0 (
-  curl -L -f -s -o "%~dp0mine-auto.bat" "https://raw.githubusercontent.com/%REPO%/main/mine-auto.bat"
+  curl -L -f -s -o "%~dp0mine-auto.bat" "!MINEAUTO_URL!"
 ) else (
-  powershell -NoProfile -Command "try { Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/%REPO%/main/mine-auto.bat' -OutFile '%~dp0mine-auto.bat' -UseBasicParsing } catch {}"
+  powershell -NoProfile -Command "try { Invoke-WebRequest -Uri '!MINEAUTO_URL!' -OutFile '%~dp0mine-auto.bat' -UseBasicParsing } catch {}"
 )
 echo   - mine-auto.bat      = auto-update launcher (recommended for 24/7)
 

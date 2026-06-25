@@ -13,7 +13,8 @@ set -euo pipefail
 #   * Runs the miner to your address. Midstate's PoW is a
 #     SEQUENTIAL BLAKE3 chain (GPU-resistant), so a good CPU is
 #     only a few× behind a GPU — both builds are worth running.
-#     The nvidia build also spawns one process per GPU device.
+#     The gpu build runs OpenCL (and CPU+GPU together in hybrid/auto) in
+#     ONE process; the binary's --mode picks cpu/gpu/hybrid/auto.
 #   * Checks GitHub for the latest release every CHECK_MIN
 #     minutes. A new version is gated through THREE checks before
 #     it ever runs (brick-safe hardening):
@@ -30,27 +31,65 @@ set -euo pipefail
 #     crash-looping rig doesn't hammer (5s,15s,60s capped). After
 #     MAX_RESTARTS rapid restarts it backs off and (optionally)
 #     runs your MIDSTATE_ON_CRASH hook.
-#  Build (default cpu; nvidia for an NVIDIA GPU):
-#     ./mine-auto.sh nvidia
+#  MODE (cpu|gpu|hybrid|auto, default auto) picks which build to download AND
+#  which --mode to run. `auto` auto-detects a GPU: if one is present it fetches
+#  the GPU build (which then runs hybrid CPU+GPU), else the CPU build. You can
+#  also force a build by passing it as the first arg (cpu | gpu):
+#     MODE=hybrid ./mine-auto.sh        # GPU build, hybrid CPU+GPU
+#     ./mine-auto.sh cpu                # force the CPU build
 #  Stop everything: Ctrl+C (this also stops the miners).
 #
 #  Env knobs (all optional):
-#     CHECK_MIN     update-poll period in minutes        (default 15)
-#     LIVE_SEC      liveness-check period in seconds      (default 30)
-#     MAX_RESTARTS  rapid restarts before backing off     (default 5)
-#     MIDSTATE_GPU_IDS  comma list of GPU ids to mine, e.g.
-#                   "0,2" to skip card 1 (default: all cards,
-#                   nvidia build only)
+#     MODE          cpu | gpu | hybrid | auto             (default auto)
+#     CHECK_MIN     update-poll period in minutes         (default 15)
+#     LIVE_SEC      liveness-check period in seconds       (default 30)
+#     MAX_RESTARTS  rapid restarts before backing off      (default 5)
 #     MIDSTATE_ON_CRASH  path to a script run once when the
 #                   restart cap is hit (driver reset, etc.)
 # ============================================================
 
 REPO="dangraagu/DGR-Midstate-pool-Public"
 
-VARIANT="${1:-cpu}"
+# MODE selects what we run (passed to the binary as --mode) AND which build to
+# fetch. Resolve it from $MODE (env), defaulting to auto. An explicit first-arg
+# build (cpu|gpu) overrides the download choice but MODE still drives --mode.
+MODE="${MODE:-auto}"
+case "$MODE" in
+  cpu|gpu|hybrid|auto) ;;
+  *) echo "[X] Unknown MODE '$MODE'. Use one of: cpu | gpu | hybrid | auto" >&2; exit 1 ;;
+esac
+
+# Which BUILD to download: the CPU-only binary, or the GPU/hybrid (OpenCL) binary.
+#   - first arg, if given, wins (cpu|gpu);
+#   - else derive from MODE: cpu => cpu build; gpu|hybrid => gpu build;
+#   - else (auto) auto-detect a GPU and pick the gpu build if one is present.
+# The gpu build also runs fine CPU-only at runtime (it degrades gracefully if no
+# OpenCL device), and the updater falls back to the cpu asset if the gpu asset is
+# missing — so this choice is never a brick.
+gpu_detected() {
+  # OpenCL-agnostic "is there likely a GPU?" probe. nvidia-smi covers NVIDIA;
+  # the presence of an ICD / clinfo covers AMD/Intel. Best-effort; a false
+  # negative just means we fetch the cpu build (still mines).
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then return 0; fi
+  if command -v clinfo >/dev/null 2>&1 && clinfo 2>/dev/null | grep -qi 'Device Name'; then return 0; fi
+  # Linux ICD vendor files present => an OpenCL platform is installed.
+  if ls /etc/OpenCL/vendors/*.icd >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+
+VARIANT="${1:-}"
+if [ -z "$VARIANT" ]; then
+  case "$MODE" in
+    cpu) VARIANT="cpu" ;;
+    gpu|hybrid) VARIANT="gpu" ;;
+    auto) if gpu_detected; then VARIANT="gpu"; else VARIANT="cpu"; fi ;;
+  esac
+fi
 case "$VARIANT" in
-  nvidia|cpu) ;;
-  *) echo "[X] Unknown build '$VARIANT'. Use one of: nvidia | cpu" >&2; exit 1 ;;
+  gpu|cpu) ;;
+  # Back-compat: an old caller may still pass 'nvidia' — treat it as the gpu build.
+  nvidia) VARIANT="gpu" ;;
+  *) echo "[X] Unknown build '$VARIANT'. Use one of: gpu | cpu" >&2; exit 1 ;;
 esac
 
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/midstate-miner"
@@ -64,13 +103,13 @@ case "$(uname -s 2>/dev/null)" in
   Darwin) PLATFORM="macos" ;;
   *)      PLATFORM="linux" ;;
 esac
-# Asset basename. cpu => midstate-miner-<platform>; a GPU variant (e.g. nvidia,
-# linux only) => midstate-miner-linux-<variant>. The name here MUST equal the
+# Asset basename. cpu => midstate-miner-<platform>; gpu => midstate-miner-<platform>-gpu
+# (the OpenCL/hybrid build, published per-OS). The name here MUST equal the
 # release asset + its SHA256SUMS key (see release.yml ASSET-NAME CONTRACT).
 if [ "$VARIANT" = "cpu" ]; then
   BIN_NAME="midstate-miner-$PLATFORM"
 else
-  BIN_NAME="midstate-miner-linux-$VARIANT"
+  BIN_NAME="midstate-miner-$PLATFORM-gpu"
 fi
 BIN="$DATA_DIR/$BIN_NAME"
 CHECK_MIN="${CHECK_MIN:-15}"
@@ -175,6 +214,9 @@ download_verify_swap() {
       BIN_NAME="midstate-miner-$PLATFORM"
       BIN="$DATA_DIR/$BIN_NAME"
       staged="$BIN.new"
+      # The CPU binary rejects --mode gpu/hybrid; downgrade an explicit GPU mode to
+      # auto so the fallback rig mines on CPU instead of erroring out on every start.
+      case "$MODE" in gpu|hybrid) MODE="auto" ;; esac
       download "https://github.com/$REPO/releases/latest/download/$BIN_NAME" "$staged" || return 1
     else
       return 1
@@ -353,40 +395,7 @@ if [ -z "$ADDR" ]; then
 fi
 printf '%s\n' "$ADDR" > "$CFG"
 
-# --- which GPU device indices to mine (nvidia build only) ------------------
-# Default: one process per detected card (0 .. NGPU-1). If MIDSTATE_GPU_IDS is set
-# (e.g. "0,2"), mine exactly those indices instead (skip a bad card). The cpu
-# build is single-process (no device index).
-count_gpus() {
-  local n=0
-  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    n="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
-  fi
-  case "$n" in ''|*[!0-9]*) n=1 ;; esac
-  [ "$n" -lt 1 ] && n=1
-  printf '%s' "$n"
-}
-
-DEVICES=()
-if [ "$VARIANT" = "cpu" ]; then
-  : # cpu build is a single process; no device list
-elif [ -n "${MIDSTATE_GPU_IDS:-}" ]; then
-  # Split on commas, trim, keep only non-negative integers.
-  IFS=',' read -r -a _raw <<< "$MIDSTATE_GPU_IDS"
-  for d in "${_raw[@]}"; do
-    d="$(printf '%s' "$d" | tr -d '[:space:]')"
-    case "$d" in
-      ''|*[!0-9]*) echo "[X] MIDSTATE_GPU_IDS entry '$d' is not a GPU index (non-negative integer)." >&2; exit 1 ;;
-      *) DEVICES+=("$d") ;;
-    esac
-  done
-  echo "Using MIDSTATE_GPU_IDS filter: mining devices ${DEVICES[*]}."
-else
-  NGPU="$(count_gpus)"
-  for ((i = 0; i < NGPU; i++)); do DEVICES+=("$i"); done
-  echo "Rig has ${#DEVICES[@]} GPU(s)."
-fi
-echo "Mining to $ADDR."
+echo "Mining to $ADDR (mode=$MODE, build=$VARIANT)."
 echo "Auto-checking GitHub for updates every $CHECK_MIN min (liveness every ${LIVE_SEC}s). Keep this running."
 echo
 
@@ -402,31 +411,20 @@ stop_miners() {
   PIDS=()
 }
 
+# Start ONE miner process. The binary handles all hardware itself: --mode picks
+# cpu / gpu / hybrid / auto, and the OpenCL backend drives every GPU device +
+# the hybrid backend runs CPU + GPU concurrently in-process. So there is exactly
+# one process per rig (no per-card fan-out, no --device/--gpu-id/--log-dir — the
+# v0.1.1 binary does not take those). If a GPU build is asked to run a GPU/hybrid
+# mode but finds no usable device at runtime it degrades or errors clearly; auto
+# always falls back to CPU. We log to a per-build file under $DATA_DIR.
 start_miners() {
   PIDS=()
-  local i LOGDIR gpu_arg=()
-
-  if [ "$VARIANT" = "cpu" ]; then
-    # cpu build: a single process (no device index).
-    LOGDIR="$DATA_DIR/cpu-log"
-    mkdir -p "$LOGDIR"
-    "$BIN" --address "$ADDR" --log-dir "$LOGDIR" \
-      > "$LOGDIR/stdout.log" 2>&1 &
-    PIDS+=("$!")
-    return 0
-  fi
-
-  # nvidia build: pass the full include-list to each process via --gpu-id
-  # (validated by the binary; informational for a single-device process but keeps
-  # the contract explicit and ready for in-process multi-GPU).
-  if [ -n "${MIDSTATE_GPU_IDS:-}" ]; then gpu_arg=(--gpu-id "$MIDSTATE_GPU_IDS"); fi
-  for i in "${DEVICES[@]}"; do
-    LOGDIR="$DATA_DIR/gpu${i}-log"
-    mkdir -p "$LOGDIR"
-    "$BIN" --address "$ADDR" --device "$i" "${gpu_arg[@]}" --log-dir "$LOGDIR" \
-      > "$LOGDIR/stdout.log" 2>&1 &
-    PIDS+=("$!")
-  done
+  local logdir="$DATA_DIR/${VARIANT}-log"
+  mkdir -p "$logdir"
+  "$BIN" --address "$ADDR" --mode "$MODE" \
+    > "$logdir/stdout.log" 2>&1 &
+  PIDS+=("$!")
 }
 
 # Are any of our launched miners still alive?

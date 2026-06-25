@@ -11,9 +11,11 @@
 
 pub mod backend;
 pub mod client;
+pub mod endpoint;
+pub mod hybrid;
+pub mod mode;
 #[cfg(feature = "opencl")]
 pub mod opencl_backend;
-pub mod endpoint;
 pub mod pow;
 pub mod stratum;
 pub mod target;
@@ -21,6 +23,8 @@ pub mod threads;
 
 pub use backend::{Backend, CpuBackend, Found};
 pub use endpoint::{pool_endpoint, EndpointList};
+pub use hybrid::{split_count, HybridBackend, SplitTuner};
+pub use mode::{select_mode, Mode, Resolved};
 pub use pow::{meets_target, midstate_pow, midstate_pow_n, EXTENSION_ITERATIONS};
 pub use stratum::{classify, Event, Incoming, Job, RpcRequest};
 pub use target::share_target;
