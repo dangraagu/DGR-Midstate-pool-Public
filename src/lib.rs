@@ -28,4 +28,4 @@ pub use mode::{select_mode, Mode, Resolved};
 pub use pow::{meets_target, midstate_pow, midstate_pow_n, EXTENSION_ITERATIONS};
 pub use stratum::{classify, Event, Incoming, Job, RpcRequest};
 pub use target::share_target;
-pub use threads::cpu_thread_budget;
+pub use threads::{cpu_only_thread_budget, cpu_thread_budget};
