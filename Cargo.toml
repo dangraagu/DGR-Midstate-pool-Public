@@ -18,9 +18,13 @@ path = "src/main.rs"
 # The CUDA backend (cudarc + committed PTX, behind a `cuda` feature) lands next.
 
 [features]
-# Off by default → toolkit-free CPU-only build. `--features opencl` adds the
-# OpenCL GPU backend (links the system OpenCL ICD loader).
+# Off by default → toolkit-free CPU-only build (Defender-safe fleet rule).
+# `--features opencl` adds the OpenCL GPU backend (links the system OpenCL ICD
+# loader). `--features wgpu` adds the wgpu/WGSL GPU backend (Vulkan/DX12/Metal/GL;
+# no CUDA/OpenCL toolkit needed). Both are mutually compatible but a release
+# binary picks one; the default CPU-only build pulls in NEITHER.
 opencl = ["dep:opencl3"]
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
 blake3 = "1.5"
@@ -32,6 +36,10 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 num_cpus = "1"
 opencl3 = { version = "0.9", optional = true }
+# wgpu GPU backend deps — optional, only compiled under `--features wgpu`.
+wgpu = { version = "29", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
 
 [profile.release]
 opt-level = 3

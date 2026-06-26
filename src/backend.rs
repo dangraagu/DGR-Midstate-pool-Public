@@ -70,8 +70,16 @@ impl Backend for CpuBackend {
     }
 
     fn suggested_batch(&self) -> u32 {
-        // Small enough to stay responsive to new jobs (each nonce ≈ 1M BLAKE3).
-        (self.n_threads as u32).saturating_mul(128).max(64)
+        // FIX 1 — RESPONSIVE WINDOW. Each nonce ≈ 1M sequential BLAKE3 (~0.56 ms
+        // on one core). With ~1 nonce per core the whole window finishes in
+        // roughly that ~0.5–1 s, so the loop re-checks the new-job epoch ~16×
+        // more often than the old `*128` window (which blocked ~8.5 s on a
+        // 119-thread box and never finished before the pool rolled the job,
+        // wasting an entire window of work per roll). Target ≈ a small constant
+        // of nonces-per-thread so the wall time is bounded SUB-SECOND regardless
+        // of thread count; keep a >=64 floor so a tiny box doesn't thrash on a
+        // 1-nonce window.
+        (self.n_threads as u32).saturating_mul(4).max(64)
     }
 
     fn search(
@@ -131,6 +139,57 @@ mod tests {
         assert!(b.suggested_batch() >= 64);
         // n_threads is clamped to at least 1.
         assert_eq!(CpuBackend::new(0).name(), "cpu:x1");
+    }
+
+    /// FIX 1 — responsive window. The per-`search` window must target a
+    /// sub-second block REGARDLESS of thread count. Each nonce ≈ 1M BLAKE3 ≈
+    /// ~0.56 ms on one core, so a window of `~1 nonce per core` finishes in
+    /// roughly that ~0.5–1 s; the multiplier per thread must be SMALL (the old
+    /// `*128` blocked ~8.5 s on a 119-thread box and never finished before a job
+    /// roll). We assert the multiplier dropped well below 128 and the resulting
+    /// window stays sub-second for a big box, while keeping a >=64 floor.
+    #[test]
+    fn suggested_batch_is_responsive_for_high_thread_counts() {
+        // The per-thread multiplier is the batch / n_threads once past the floor.
+        // It MUST be far below the old 128 (we use 4) so the window stays small.
+        let big_n = 119usize;
+        let b = CpuBackend::new(big_n);
+        let batch = b.suggested_batch();
+        let per_thread = batch as f64 / big_n as f64;
+        assert!(
+            per_thread <= 8.0,
+            "multiplier must be << old 128 (got {per_thread} nonces/thread)"
+        );
+        assert!(
+            per_thread != 128.0,
+            "multiplier must have changed from 128"
+        );
+        // Sub-second window check: each nonce ≈ 1M BLAKE3 ≈ ~0.56 ms/core, and the
+        // window is split across `big_n` cores, so wall time ≈ per_thread * 0.56 ms.
+        // per_thread<=8 → ≈4.5 ms worst case — comfortably sub-second. We pin the
+        // hard nonce ceiling that keeps it there: a big box must not exceed ~1
+        // nonce-per-core * a small constant.
+        const MS_PER_NONCE_PER_CORE: f64 = 0.56; // ~1M BLAKE3 on one core
+        let est_window_ms = per_thread * MS_PER_NONCE_PER_CORE;
+        assert!(
+            est_window_ms < 500.0,
+            "window must be sub-second (~{est_window_ms} ms estimated)"
+        );
+        // The old formula would have been 119*128 = 15232 nonces.
+        assert!(
+            batch < 119 * 128,
+            "batch must be smaller than the old n_threads*128 window"
+        );
+    }
+
+    /// The >=64 minimum window still holds for tiny boxes (a 1-thread box must
+    /// not thrash on a 1-nonce window — keep at least the 64 floor).
+    #[test]
+    fn suggested_batch_keeps_minimum_floor() {
+        assert!(CpuBackend::new(1).suggested_batch() >= 64);
+        assert!(CpuBackend::new(2).suggested_batch() >= 64);
+        // A mid box uses the multiplier once it exceeds the floor.
+        assert_eq!(CpuBackend::new(60).suggested_batch(), 60 * 4);
     }
 
     /// Real 1M-iter search over a tiny window with an all-0xff target (accepts

@@ -4,7 +4,9 @@ use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use midstate_miner::client::{run, ClientConfig};
 use midstate_miner::mode::{select_mode, Mode, Resolved};
-use midstate_miner::{cpu_thread_budget, pool_endpoint, Backend, CpuBackend, HybridBackend};
+use midstate_miner::{
+    cpu_only_thread_budget, cpu_thread_budget, pool_endpoint, Backend, CpuBackend, HybridBackend,
+};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -42,13 +44,18 @@ fn main() -> Result<()> {
     let endpoint = pool_endpoint(); // compiled-in, e.g. midstate.yamaduo.no:3666
     let (host, port) = parse_endpoint(&endpoint)?;
     let physical = num_cpus::get_physical().max(1);
+    // FIX 3 — logical (vCPU) count. The CPU-only path budgets off this so a rented
+    // box (physical ≈ logical/2) runs all its vCPUs instead of ~half.
+    let logical = num_cpus::get().max(physical);
 
     // The legacy `--cpu` flag is an alias for `--mode cpu` (force CPU). If both are
     // given, `--cpu` wins (it's the more conservative, never-touch-the-GPU choice).
     let requested = if cli.cpu { Mode::Cpu } else { cli.mode };
 
-    println!("midstate-miner | endpoint={endpoint} | physical_cores={physical}");
-    let mut backend = select_backend(requested, physical, cli.cpu_threads)?;
+    println!(
+        "midstate-miner | endpoint={endpoint} | logical_cores={logical} physical_cores={physical}"
+    );
+    let mut backend = select_backend(requested, physical, logical, cli.cpu_threads)?;
 
     let cfg = ClientConfig {
         host,
@@ -62,28 +69,42 @@ fn main() -> Result<()> {
     run(cfg, backend.as_mut(), dur)
 }
 
-/// Was the `opencl` feature compiled into THIS binary?
-const OPENCL_BUILT: bool = cfg!(feature = "opencl");
+/// Was a GPU backend (either `wgpu` or `opencl`) compiled into THIS binary?
+/// Drives mode resolution: `--mode gpu/hybrid` need a GPU build to be satisfiable.
+const GPU_BUILT: bool = cfg!(feature = "wgpu") || cfg!(feature = "opencl");
 
-/// Try to construct an OpenCL GPU backend. Returns `Ok(Some(b))` on a usable
-/// device, `Ok(None)` if no device/ICD, `Err` only on a hard build error. Always
-/// `Ok(None)` when the feature isn't compiled in (so a CPU-only binary degrades
+/// Try to construct a GPU backend. Returns `Ok(Some(b))` on a usable device,
+/// `Ok(None)` if no device/driver, `Err` only on a hard build error. Always
+/// `Ok(None)` when no GPU feature is compiled in (so a CPU-only binary degrades
 /// gracefully instead of failing to build).
-#[cfg(feature = "opencl")]
+///
+/// PREFERENCE: when both features are compiled in, `wgpu` (Vulkan/DX12/Metal/GL,
+/// checkpointed dispatch — no TDR) is tried first; `opencl` is the fallback.
 fn try_gpu_backend() -> Result<Option<Box<dyn Backend>>> {
-    match midstate_miner::opencl_backend::OpenClBackend::try_new() {
-        Ok(Some(b)) => Ok(Some(Box::new(b))),
-        Ok(None) => Ok(None),
-        Err(e) => {
-            // A missing ICD loader / driver surfaces here on some boxes. Treat it
-            // as "no GPU" so a CPU-only machine running the GPU binary still mines.
-            eprintln!("OpenCL init failed: {e}; treating as no-GPU");
-            Ok(None)
+    #[cfg(feature = "wgpu")]
+    {
+        match midstate_miner::wgpu_backend::WgpuBackend::try_new() {
+            Ok(Some(b)) => return Ok(Some(Box::new(b))),
+            Ok(None) => {} // no usable wgpu adapter — try opencl (if built) / CPU
+            Err(e) => {
+                // Device/shader init or self-test failure: never mine on a GPU we
+                // couldn't prove bit-exact. Treat as no-GPU and fall through.
+                eprintln!("wgpu init/self-test failed: {e}; treating as no-wgpu-GPU");
+            }
         }
     }
-}
-#[cfg(not(feature = "opencl"))]
-fn try_gpu_backend() -> Result<Option<Box<dyn Backend>>> {
+    #[cfg(feature = "opencl")]
+    {
+        match midstate_miner::opencl_backend::OpenClBackend::try_new() {
+            Ok(Some(b)) => return Ok(Some(Box::new(b))),
+            Ok(None) => {}
+            Err(e) => {
+                // A missing ICD loader / driver surfaces here on some boxes. Treat
+                // it as "no GPU" so a CPU-only machine running the GPU binary mines.
+                eprintln!("OpenCL init failed: {e}; treating as no-GPU");
+            }
+        }
+    }
     Ok(None)
 }
 
@@ -98,6 +119,7 @@ fn try_gpu_backend() -> Result<Option<Box<dyn Backend>>> {
 fn select_backend(
     requested: Mode,
     physical: usize,
+    logical: usize,
     cpu_threads: Option<usize>,
 ) -> Result<Box<dyn Backend>> {
     // --- AUTO-DISCOVER ------------------------------------------------------
@@ -112,8 +134,8 @@ fn select_backend(
     let gpu_label = gpu_backend.as_deref().map(|b| b.name().to_string());
 
     println!(
-        "discover: opencl_built={} gpu_present={}{}",
-        OPENCL_BUILT,
+        "discover: gpu_built={} gpu_present={}{}",
+        GPU_BUILT,
         gpu_present,
         gpu_label
             .as_deref()
@@ -121,17 +143,24 @@ fn select_backend(
             .unwrap_or_default()
     );
 
-    let resolved = select_mode(requested, OPENCL_BUILT, gpu_present);
+    let resolved = select_mode(requested, GPU_BUILT, gpu_present);
     match resolved {
         Resolved::Error(msg) => bail!("{msg}"),
         Resolved::Cpu => {
-            // No GPU mining → use all cores (gpu_active=false).
-            let threads = cpu_thread_budget(physical, false, cpu_threads);
+            // FIX 3 — No GPU mining → budget off LOGICAL cores (all vCPUs), and
+            // honor a --cpu-threads override UP TO logical (it may exceed physical).
+            let threads = cpu_only_thread_budget(logical, cpu_threads);
             if threads == 0 {
                 bail!("0 CPU threads after budget — nothing to mine");
             }
             let b = CpuBackend::new(threads);
-            println!("mode=cpu | backend: {} ({} threads)", b.name(), threads);
+            println!(
+                "mode=cpu | backend: {} ({} threads of {} logical / {} physical)",
+                b.name(),
+                threads,
+                logical,
+                physical
+            );
             Ok(Box::new(b))
         }
         Resolved::Gpu => {

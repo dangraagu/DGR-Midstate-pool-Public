@@ -37,6 +37,30 @@ pub fn cpu_thread_budget(
     }
 }
 
+/// FIX 3 — CPU-ONLY thread budget, based on **LOGICAL** cores.
+///
+/// On a rented box the reported physical-core count is often ~half the logical
+/// (vCPU) count, and the GPU-path budget above (which uses `physical_cores`)
+/// would silently run a CPU-only miner at ~half throughput. When there is NO GPU
+/// in play, AVX2 BLAKE3's port-bound argument doesn't apply the same way to a
+/// rented vCPU box — the operator paid for all the vCPUs and wants them grinding
+/// — so the CPU-only path uses ALL logical cores by default.
+///
+/// - `logical_cores`: logical / vCPU count (`num_cpus::get()`), the ceiling.
+/// - `user_override`: an explicit `--cpu-threads N`. Honored UP TO `logical_cores`
+///   — crucially it MAY exceed the physical count (that's the whole point); it is
+///   only clamped at the logical ceiling so we never oversubscribe far beyond the
+///   hardware. Asking for fewer is honored.
+///
+/// This path NEVER applies the "leave 2 free" rule — that guard exists only to
+/// protect a co-resident GPU feeder/OS, and there is no GPU here.
+pub fn cpu_only_thread_budget(logical_cores: usize, user_override: Option<usize>) -> usize {
+    match user_override {
+        Some(n) => n.min(logical_cores),
+        None => logical_cores,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +95,47 @@ mod tests {
         assert_eq!(cpu_thread_budget(12, true, Some(4)), 4);
         assert_eq!(cpu_thread_budget(12, false, Some(8)), 8);
         assert_eq!(cpu_thread_budget(12, true, Some(0)), 0); // user disables CPU
+    }
+
+    // ─────────────────────── FIX 3 — CPU-ONLY uses LOGICAL cores ────────────────
+
+    /// CPU-only path: the budget is based on LOGICAL cores, not physical. On a
+    /// rented box reporting 60 physical / 120 logical, a CPU-only miner must use
+    /// all 120 logical cores (the old code clamped to ~60 physical → ran ~half).
+    #[test]
+    fn cpu_only_budget_uses_logical_cores() {
+        // 120 logical cores, no override → use all 120 (NOT the ~60 physical).
+        assert_eq!(cpu_only_thread_budget(120, None), 120);
+        assert_eq!(cpu_only_thread_budget(6, None), 6);
+        assert_eq!(cpu_only_thread_budget(1, None), 1);
+        // Saturates to 0 on a 0-core report (caller logs nothing-to-mine).
+        assert_eq!(cpu_only_thread_budget(0, None), 0);
+    }
+
+    /// CPU-only path: an explicit `--cpu-threads N` is honored UP TO logical —
+    /// crucially it may ask for MORE than physical (the whole point of the fix),
+    /// and is only clamped at the logical ceiling.
+    #[test]
+    fn cpu_only_override_honored_above_physical_up_to_logical() {
+        // Box: 60 physical, 120 logical. Operator asks for 100 (> physical) → 100.
+        assert_eq!(cpu_only_thread_budget(120, Some(100)), 100);
+        // Asking for exactly logical is fine.
+        assert_eq!(cpu_only_thread_budget(120, Some(120)), 120);
+        // Asking ABOVE logical clamps to logical (don't oversubscribe wildly).
+        assert_eq!(cpu_only_thread_budget(120, Some(500)), 120);
+        // Asking for fewer is honored.
+        assert_eq!(cpu_only_thread_budget(120, Some(8)), 8);
+    }
+
+    /// The GPU/hybrid path is UNCHANGED: still physical-minus-2, override clamped
+    /// to that ceiling. (Same as `cpu_thread_budget(.., true, ..)`.)
+    #[test]
+    fn gpu_path_still_physical_minus_two() {
+        // 60 physical, GPU active → 58, even if logical is 120.
+        assert_eq!(cpu_thread_budget(60, true, None), 58);
+        // Override above the physical-2 ceiling is still clamped down.
+        assert_eq!(cpu_thread_budget(60, true, Some(120)), 58);
+        // hybrid.rs:185 path: cpu_thread_budget(physical, true, None).
+        assert_eq!(cpu_thread_budget(12, true, None), 10);
     }
 }
