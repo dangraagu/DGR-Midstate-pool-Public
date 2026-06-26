@@ -413,18 +413,69 @@ pub fn verify_candidates(midstate: &[u8; 32], target: &[u8; 32], candidates: &[u
 
 // ── Adapter selection (ported from upstream `pick_adapter`) ───────────────────
 
-/// Choose the GPU adapter to mine on. Enumerates all adapters across all backends,
-/// honors a `WGPU_ADAPTER_NAME` case-insensitive substring override, otherwise
-/// drops pure-software adapters and ranks discrete > integrated > virtual,
-/// preferring Vulkan > Dx12 > Metal > GL within a tier. Errors (→ CPU fallback) if
-/// nothing usable is found.
-async fn pick_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
+/// One display line for an adapter: `index: name [device_type] (backend)`.
+fn adapter_line(i: usize, a: &wgpu::Adapter) -> String {
+    let info = a.get_info();
+    format!("{i}: {} [{:?}] ({:?})", info.name, info.device_type, info.backend)
+}
+
+/// Format the full adapter list as `index: name [device_type] (backend)` lines,
+/// one per line. Used for the error message when an explicit `--gpu-id` is out of
+/// range.
+fn adapter_list_string(adapters: &[wgpu::Adapter]) -> String {
+    adapters
+        .iter()
+        .enumerate()
+        .map(|(i, a)| adapter_line(i, a))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Enumerate every GPU adapter across all backends and return one display line per
+/// adapter (`index: name [device_type] (backend)`). Owns its own `Instance` so it
+/// can be called standalone for `--list-gpus` without constructing a backend.
+/// Returns an empty Vec if no adapters are present.
+pub fn list_adapters() -> Vec<String> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+    adapters
+        .iter()
+        .enumerate()
+        .map(|(i, a)| adapter_line(i, a))
+        .collect()
+}
+
+/// Choose the GPU adapter to mine on. Enumerates all adapters across all backends.
+///
+/// When `gpu_id` is `Some(idx)` the caller has EXPLICITLY pinned a device: select
+/// `adapters[idx]` LITERALLY (no software-skip, no ranking — the boot `self_test`
+/// still gates whatever is picked), and bail with the full adapter list if `idx`
+/// is out of range so a typo fails loudly instead of silently mining the wrong card.
+///
+/// When `gpu_id` is `None` (auto), honor a `WGPU_ADAPTER_NAME` case-insensitive
+/// substring override, otherwise drop pure-software adapters and rank
+/// discrete > integrated > virtual, preferring Vulkan > Dx12 > Metal > GL within a
+/// tier. Errors (→ CPU fallback) if nothing usable is found.
+async fn pick_adapter(instance: &wgpu::Instance, gpu_id: Option<usize>) -> Result<wgpu::Adapter> {
     let mut adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
     if adapters.is_empty() {
         bail!(
             "no GPU adapters found. wgpu uses Vulkan/DX12/Metal/GL, not CUDA — an NVIDIA \
              card needs its Vulkan ICD installed (verify with `vulkaninfo --summary`)."
         );
+    }
+
+    // Explicit --gpu-id: literal index into the enumerated list (no skipping).
+    if let Some(idx) = gpu_id {
+        if idx >= adapters.len() {
+            bail!(
+                "--gpu-id {idx} is out of range: only {} GPU adapter(s) found:\n{}",
+                adapters.len(),
+                adapter_list_string(&adapters)
+            );
+        }
+        return Ok(adapters.swap_remove(idx));
     }
 
     let name_pref = std::env::var("WGPU_ADAPTER_NAME")
@@ -489,8 +540,8 @@ impl WgpuBackend {
     /// (the caller treats both as "no GPU" and falls back to CPU). On success the
     /// returned backend has ALREADY passed [`self_test`] — it is consensus-safe to
     /// mine with or this returns `Err`.
-    pub fn try_new() -> Result<Option<Self>> {
-        match pollster::block_on(Self::new_async()) {
+    pub fn try_new(gpu_id: Option<usize>) -> Result<Option<Self>> {
+        match pollster::block_on(Self::new_async(gpu_id)) {
             Ok(b) => {
                 b.self_test()?; // refuse to mine unless bit-exact vs the CPU reference
                 Ok(Some(b))
@@ -507,11 +558,11 @@ impl WgpuBackend {
         }
     }
 
-    async fn new_async() -> Result<Self> {
+    async fn new_async(gpu_id: Option<usize>) -> Result<Self> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
 
-        let adapter = pick_adapter(&instance).await?;
+        let adapter = pick_adapter(&instance, gpu_id).await?;
         let info = adapter.get_info();
         let name = format!("wgpu:{} [{:?} via {:?}]", info.name, info.device_type, info.backend);
 

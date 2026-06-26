@@ -96,6 +96,16 @@ jobs:
           cargo build --release
           Copy-Item target/release/midstate-miner.exe dist/midstate-miner.exe
 
+      # ⚠️ FLAG (v0.1.4): the Linux + macOS -gpu binaries moved to `--features wgpu`
+      # (cross-platform, no toolkit). The WINDOWS -gpu binary is INTENTIONALLY left
+      # on `--features opencl` here per the task's "do not change the windows job if
+      # it would break" guard — switching it to wgpu (DX12/Vulkan) is plausible and
+      # would drop the vcpkg/OpenCL-SDK step, but it was NOT validated on a Windows
+      # CI runner in this change, so it's deferred to avoid bricking the Windows GPU
+      # asset. (Local Windows wgpu builds + a live RTX 5070 Ti mine WERE validated;
+      # only the CI matrix entry is unverified.) Revisit when a Windows wgpu CI run
+      # is green: replace this vcpkg step + the build below with `--features wgpu`.
+      #
       # GPU/hybrid build (--features opencl). Install the OpenCL SDK (headers + the
       # OpenCL.lib import library the linker needs) via vcpkg, which is preinstalled
       # on windows-latest. The ICD loader (OpenCL.dll) ships with the GPU driver on
@@ -143,17 +153,15 @@ jobs:
           cargo build --release
           cp target/release/midstate-miner dist/midstate-miner-linux
 
-      # GPU/hybrid build (--features opencl). ocl-icd-opencl-dev provides the ICD
-      # loader (libOpenCL.so) + headers to link against. The runtime ICD for the
-      # user's actual GPU ships with their driver; this only satisfies the linker.
-      - name: Install OpenCL build deps (ubuntu)
+      # GPU/hybrid build (--features wgpu). wgpu is cross-platform (Vulkan/DX12/
+      # Metal/GL) and needs NO OpenCL/CUDA toolkit to COMPILE — it's pure Rust and
+      # loads the Vulkan ICD at runtime from the user's GPU driver. So no apt
+      # install is required here (the old ocl-icd-opencl-dev step is gone). The
+      # WGSL kernel is bit-exact + CPU-re-verified and the checkpointed dispatch
+      # avoids the desktop GPU watchdog (TDR) the OpenCL backend was exposed to.
+      - name: Build GPU (wgpu)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ocl-icd-opencl-dev
-
-      - name: Build GPU (opencl)
-        run: |
-          cargo build --release --features opencl
+          cargo build --release --features wgpu
           cp target/release/midstate-miner dist/midstate-miner-linux-gpu
 
       # Publish the self-updating launchers as release assets. Existing rigs
@@ -172,6 +180,20 @@ jobs:
             echo "staged launchers:"; ls -1 dist/mine-auto.sh dist/mine-auto.bat
           else
             echo "::warning::mine-auto.sh / mine-auto.bat not found in repo root — self-update launchers will NOT be published this release."
+          fi
+
+      # Multi-GPU launcher (one midstate-miner process per GPU via --gpu-id). Staged
+      # in the SAME job whose dist/ the single release job flattens + checksums, so
+      # it lands in SHA256SUMS like the other assets. Not self-updating (operators
+      # fetch it once); a missing file is a warning, not a hard failure.
+      - name: Stage multi-GPU launcher (mine-multi-gpu.sh)
+        run: |
+          set -euo pipefail
+          if [ -f mine-multi-gpu.sh ]; then
+            cp mine-multi-gpu.sh dist/
+            echo "staged multi-GPU launcher:"; ls -1 dist/mine-multi-gpu.sh
+          else
+            echo "::warning::mine-multi-gpu.sh not found in repo root — multi-GPU launcher will NOT be published this release."
           fi
 
       # Publish a tiny version-pointer asset. The launchers resolve "latest" by
@@ -222,12 +244,12 @@ jobs:
           cargo build --release
           cp target/release/midstate-miner dist/midstate-miner-macos
 
-      # GPU/hybrid build (--features opencl). macOS ships the OpenCL framework
-      # system-wide; opencl-sys links -framework OpenCL with NO extra install.
-      # (Apple deprecated OpenCL but it still links + runs on current macOS.)
-      - name: Build GPU (opencl)
+      # GPU/hybrid build (--features wgpu). wgpu uses Metal on macOS — no toolkit
+      # to install, and it builds as pure Rust. (Replaces the deprecated OpenCL
+      # framework path; the WGSL kernel is bit-exact + CPU-re-verified.)
+      - name: Build GPU (wgpu)
         run: |
-          cargo build --release --features opencl
+          cargo build --release --features wgpu
           cp target/release/midstate-miner dist/midstate-miner-macos-gpu
 
       - name: List built artifacts

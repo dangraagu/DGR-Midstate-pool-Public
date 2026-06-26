@@ -4,6 +4,32 @@ All notable changes to **midstate-pool-miner** are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-06-26
+
+### Added
+
+- **wgpu GPU backend (`--features wgpu`)** — a cross-platform GPU backend on
+  Vulkan / DX12 / Metal (no CUDA or OpenCL toolkit required). Its WGSL kernel is
+  **bit-exact** to the CPU reference: every GPU-surfaced candidate nonce is
+  **re-verified on the CPU** before it can become a share, and the backend runs a
+  full 1,000,000-iteration self-test at boot that **fail-closes to CPU** on any
+  mismatch — a buggy or non-deterministic driver can only cost throughput, never
+  produce an invalid share. The dispatch loop is checkpointed (~2,000 iters per
+  dispatch) so it does not trip the OS GPU watchdog (TDR).
+- **Multi-GPU support** — `--gpu-id <index>` pins a process to one GPU and
+  `--list-gpus` prints the visible adapters (index, name, type, backend). An
+  explicit `--gpu-id` fails LOUDLY on a bad/unusable index instead of silently
+  falling back to CPU. The new `mine-multi-gpu.sh` launcher runs one process per
+  GPU (first = hybrid CPU+GPU, the rest GPU-only) with per-GPU logs and a
+  liveness/backoff restart loop.
+
+### Changed
+
+- **`-gpu` release binaries are now built with `--features wgpu`** (Linux and
+  macOS) instead of `--features opencl` — wgpu is cross-platform and needs no
+  OpenCL toolkit, and the checkpointed dispatch avoids the desktop GPU watchdog.
+  The CPU builds are unchanged.
+
 ## [0.1.1] - 2026-06-25
 
 First public release — prebuilt, SHA-256-verified binaries for Windows, Linux,
@@ -50,4 +76,5 @@ launcher.
   been validated against the golden vectors on POCL; if you hit a GPU-specific
   reject pattern, fall back to `--mode cpu` and report it.
 
+[0.1.4]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.4
 [0.1.1]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.1

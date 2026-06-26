@@ -17,8 +17,9 @@ use std::time::Duration;
 )]
 struct Cli {
     /// Your Midstate payout address (hex) — get it from your Midstate node/wallet.
+    /// Required to MINE; optional for pure queries like `--list-gpus`.
     #[arg(long)]
-    address: String,
+    address: Option<String>,
     /// Mining mode: cpu | gpu | hybrid | auto. `auto` (default) discovers the
     /// hardware and runs hybrid (CPU+GPU) if a usable OpenCL GPU is present, else
     /// cpu. `gpu`/`hybrid` error clearly if no GPU is available in this build.
@@ -37,10 +38,33 @@ struct Cli {
     /// Stop after N seconds (0 = run forever).
     #[arg(long, default_value_t = 0)]
     duration: u64,
+    /// Pin mining to a specific GPU by its index (see `--list-gpus`). When set, an
+    /// out-of-range or unusable index fails LOUDLY instead of silently falling back
+    /// to CPU — so you always mine the card you asked for, or learn why you can't.
+    /// Used for multi-GPU rigs (one process per `--gpu-id`). Omit for auto-select.
+    #[arg(long)]
+    gpu_id: Option<usize>,
+    /// List the GPU adapters this binary can see (index, name, type, backend) and
+    /// exit. Use the printed index with `--gpu-id`. Requires a `wgpu` build.
+    #[arg(long, default_value_t = false)]
+    list_gpus: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // `--list-gpus` is a pure query: enumerate adapters and exit BEFORE any pool
+    // connection or backend construction.
+    if cli.list_gpus {
+        return list_gpus();
+    }
+
+    // From here on we are MINING, which requires a payout address. (It is optional
+    // on the CLI only so pure queries like `--list-gpus` can run without one.)
+    let address = cli
+        .address
+        .ok_or_else(|| anyhow!("--address <hex> is required to mine (omit only for --list-gpus)"))?;
+
     let endpoint = pool_endpoint(); // compiled-in, e.g. midstate.yamaduo.no:3666
     let (host, port) = parse_endpoint(&endpoint)?;
     let physical = num_cpus::get_physical().max(1);
@@ -55,12 +79,12 @@ fn main() -> Result<()> {
     println!(
         "midstate-miner | endpoint={endpoint} | logical_cores={logical} physical_cores={physical}"
     );
-    let mut backend = select_backend(requested, physical, logical, cli.cpu_threads)?;
+    let mut backend = select_backend(requested, physical, logical, cli.cpu_threads, cli.gpu_id)?;
 
     let cfg = ClientConfig {
         host,
         port,
-        address: cli.address,
+        address,
         share_bits: cli.share_bits,
         reconnect_backoff: Duration::from_secs(5),
         read_timeout: Duration::from_secs(120),
@@ -73,6 +97,36 @@ fn main() -> Result<()> {
 /// Drives mode resolution: `--mode gpu/hybrid` need a GPU build to be satisfiable.
 const GPU_BUILT: bool = cfg!(feature = "wgpu") || cfg!(feature = "opencl");
 
+/// `--list-gpus` implementation for a `wgpu` build: enumerate every adapter and
+/// print one `index: name [type] (backend)` line, or a clear note if none. The
+/// index printed here is exactly what `--gpu-id` expects.
+#[cfg(feature = "wgpu")]
+fn list_gpus() -> Result<()> {
+    let adapters = midstate_miner::wgpu_backend::list_adapters();
+    if adapters.is_empty() {
+        println!(
+            "no GPU adapters found. wgpu uses Vulkan/DX12/Metal/GL, not CUDA — an NVIDIA \
+             card needs its Vulkan ICD installed (verify with `vulkaninfo --summary`)."
+        );
+    } else {
+        for line in adapters {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// `--list-gpus` on a non-`wgpu` build: there is no adapter enumerator to call, so
+/// say so plainly (the CPU-only / OpenCL builds don't ship one).
+#[cfg(not(feature = "wgpu"))]
+fn list_gpus() -> Result<()> {
+    println!(
+        "--list-gpus requires a wgpu build. This binary was built without the `wgpu` \
+         feature, so it has no GPU-adapter enumerator."
+    );
+    Ok(())
+}
+
 /// Try to construct a GPU backend. Returns `Ok(Some(b))` on a usable device,
 /// `Ok(None)` if no device/driver, `Err` only on a hard build error. Always
 /// `Ok(None)` when no GPU feature is compiled in (so a CPU-only binary degrades
@@ -80,15 +134,25 @@ const GPU_BUILT: bool = cfg!(feature = "wgpu") || cfg!(feature = "opencl");
 ///
 /// PREFERENCE: when both features are compiled in, `wgpu` (Vulkan/DX12/Metal/GL,
 /// checkpointed dispatch — no TDR) is tried first; `opencl` is the fallback.
-fn try_gpu_backend() -> Result<Option<Box<dyn Backend>>> {
+fn try_gpu_backend(gpu_id: Option<usize>) -> Result<Option<Box<dyn Backend>>> {
+    // `gpu_id` is consumed only by the wgpu arm; in a CPU-only / opencl-only build
+    // it is unused — acknowledge it so there's no unused-variable warning.
+    #[cfg(not(feature = "wgpu"))]
+    let _ = gpu_id;
     #[cfg(feature = "wgpu")]
     {
-        match midstate_miner::wgpu_backend::WgpuBackend::try_new() {
+        match midstate_miner::wgpu_backend::WgpuBackend::try_new(gpu_id) {
             Ok(Some(b)) => return Ok(Some(Box::new(b))),
             Ok(None) => {} // no usable wgpu adapter — try opencl (if built) / CPU
             Err(e) => {
-                // Device/shader init or self-test failure: never mine on a GPU we
-                // couldn't prove bit-exact. Treat as no-GPU and fall through.
+                // An EXPLICIT --gpu-id must never silently fall back to CPU: a bad
+                // index or an un-initable pinned card is a user error to surface,
+                // not paper over. Propagate it.
+                if gpu_id.is_some() {
+                    return Err(e);
+                }
+                // Auto-select: device/shader init or self-test failure → never mine
+                // on a GPU we couldn't prove bit-exact. Treat as no-GPU, fall through.
                 eprintln!("wgpu init/self-test failed: {e}; treating as no-wgpu-GPU");
             }
         }
@@ -121,6 +185,7 @@ fn select_backend(
     physical: usize,
     logical: usize,
     cpu_threads: Option<usize>,
+    gpu_id: Option<usize>,
 ) -> Result<Box<dyn Backend>> {
     // --- AUTO-DISCOVER ------------------------------------------------------
     // Probe for a GPU only when the request could USE one (cpu mode never probes,
@@ -128,7 +193,7 @@ fn select_backend(
     // the device once and reuse it for hybrid/gpu so we don't init twice.
     let mut gpu_backend: Option<Box<dyn Backend>> = None;
     if matches!(requested, Mode::Gpu | Mode::Hybrid | Mode::Auto) {
-        gpu_backend = try_gpu_backend()?;
+        gpu_backend = try_gpu_backend(gpu_id)?;
     }
     let gpu_present = gpu_backend.is_some();
     let gpu_label = gpu_backend.as_deref().map(|b| b.name().to_string());
