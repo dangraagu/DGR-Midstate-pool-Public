@@ -15,16 +15,22 @@ path = "src/lib.rs"
 name = "midstate-miner"
 path = "src/main.rs"
 
-# The CUDA backend (cudarc + committed PTX, behind a `cuda` feature) lands next.
+# The CUDA backend (cudarc + committed PTX, behind a `cuda` feature) is the native
+# path for rented NVIDIA CUDA-compute containers where wgpu/Vulkan is unavailable.
 
 [features]
 # Off by default → toolkit-free CPU-only build (Defender-safe fleet rule).
 # `--features opencl` adds the OpenCL GPU backend (links the system OpenCL ICD
 # loader). `--features wgpu` adds the wgpu/WGSL GPU backend (Vulkan/DX12/Metal/GL;
-# no CUDA/OpenCL toolkit needed). Both are mutually compatible but a release
-# binary picks one; the default CPU-only build pulls in NEITHER.
+# no CUDA/OpenCL toolkit needed). `--features cuda` adds the CUDA backend via
+# `cudarc` with DYNAMIC-LOADING: it dlopen()s the driver (libcuda) at RUNTIME and
+# JIT-compiles the committed PTX (src/cuda/midstate.ptx), so the build needs NO
+# CUDA toolkit on the link path — only the committed PTX + the driver on the rig.
+# All three are mutually compatible but a release binary picks one; the default
+# CPU-only build pulls in NONE.
 opencl = ["dep:opencl3"]
 wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+cuda = ["dep:cudarc"]
 
 [dependencies]
 blake3 = "1.5"
@@ -40,6 +46,12 @@ opencl3 = { version = "0.9", optional = true }
 wgpu = { version = "29", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
+# CUDA GPU backend dep — optional, only compiled under `--features cuda`.
+# `dynamic-loading` = dlopen libcuda at RUNTIME (no CUDA toolkit on the link path,
+# so the Linux/CI build needs only the committed PTX + the driver on the rig).
+# `cuda-12080` pins the driver-API bindings to a widely-available baseline; the
+# driver is forward-compatible, so newer rig drivers JIT the compute_75 PTX fine.
+cudarc = { version = "0.19", default-features = false, features = ["driver", "nvrtc", "dynamic-loading", "cuda-12080"], optional = true }
 
 [profile.release]
 opt-level = 3

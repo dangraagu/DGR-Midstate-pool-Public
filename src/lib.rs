@@ -11,6 +11,8 @@
 
 pub mod backend;
 pub mod client;
+#[cfg(feature = "cuda")]
+pub mod cuda_backend;
 pub mod endpoint;
 pub mod hybrid;
 pub mod mode;

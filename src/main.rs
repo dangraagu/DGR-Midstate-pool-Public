@@ -93,37 +93,54 @@ fn main() -> Result<()> {
     run(cfg, backend.as_mut(), dur)
 }
 
-/// Was a GPU backend (either `wgpu` or `opencl`) compiled into THIS binary?
+/// Was a GPU backend (`cuda`, `wgpu`, or `opencl`) compiled into THIS binary?
 /// Drives mode resolution: `--mode gpu/hybrid` need a GPU build to be satisfiable.
-const GPU_BUILT: bool = cfg!(feature = "wgpu") || cfg!(feature = "opencl");
+const GPU_BUILT: bool =
+    cfg!(feature = "cuda") || cfg!(feature = "wgpu") || cfg!(feature = "opencl");
 
-/// `--list-gpus` implementation for a `wgpu` build: enumerate every adapter and
-/// print one `index: name [type] (backend)` line, or a clear note if none. The
-/// index printed here is exactly what `--gpu-id` expects.
-#[cfg(feature = "wgpu")]
+/// Whether THIS binary can enumerate GPU devices for `--list-gpus` (cuda lists
+/// CUDA devices; wgpu lists adapters). An OpenCL-only / CPU-only build cannot.
+const LIST_GPUS_BUILT: bool = cfg!(feature = "cuda") || cfg!(feature = "wgpu");
+
+/// `--list-gpus`: enumerate every GPU this binary can see and print one
+/// `index: name …` line. CUDA devices first (the native path for these rigs),
+/// then wgpu adapters. The index printed for each backend is exactly what
+/// `--gpu-id` expects for a binary built with that backend. Prints a clear note
+/// if none / not a GPU-enumerable build.
 fn list_gpus() -> Result<()> {
-    let adapters = midstate_miner::wgpu_backend::list_adapters();
-    if adapters.is_empty() {
-        println!(
-            "no GPU adapters found. wgpu uses Vulkan/DX12/Metal/GL, not CUDA — an NVIDIA \
-             card needs its Vulkan ICD installed (verify with `vulkaninfo --summary`)."
-        );
-    } else {
-        for line in adapters {
+    // `mut` is used only when a cuda/wgpu feature is compiled in (those blocks set
+    // it); in a CPU-only / opencl-only build both blocks vanish and it stays false.
+    #[allow(unused_mut)]
+    let mut printed = false;
+
+    #[cfg(feature = "cuda")]
+    {
+        for line in midstate_miner::cuda_backend::list_devices() {
             println!("{line}");
+            printed = true;
         }
     }
-    Ok(())
-}
+    #[cfg(feature = "wgpu")]
+    {
+        for line in midstate_miner::wgpu_backend::list_adapters() {
+            println!("{line}");
+            printed = true;
+        }
+    }
 
-/// `--list-gpus` on a non-`wgpu` build: there is no adapter enumerator to call, so
-/// say so plainly (the CPU-only / OpenCL builds don't ship one).
-#[cfg(not(feature = "wgpu"))]
-fn list_gpus() -> Result<()> {
-    println!(
-        "--list-gpus requires a wgpu build. This binary was built without the `wgpu` \
-         feature, so it has no GPU-adapter enumerator."
-    );
+    if !printed {
+        if LIST_GPUS_BUILT {
+            println!(
+                "no GPU devices found. CUDA needs the NVIDIA driver (libcuda); wgpu uses \
+                 Vulkan/DX12/Metal/GL — verify with `nvidia-smi` / `vulkaninfo --summary`."
+            );
+        } else {
+            println!(
+                "--list-gpus requires a cuda or wgpu build. This binary was built without \
+                 either, so it has no GPU-device enumerator."
+            );
+        }
+    }
     Ok(())
 }
 
@@ -132,13 +149,34 @@ fn list_gpus() -> Result<()> {
 /// `Ok(None)` when no GPU feature is compiled in (so a CPU-only binary degrades
 /// gracefully instead of failing to build).
 ///
-/// PREFERENCE: when both features are compiled in, `wgpu` (Vulkan/DX12/Metal/GL,
-/// checkpointed dispatch — no TDR) is tried first; `opencl` is the fallback.
+/// PREFERENCE: when multiple GPU features are compiled in, `cuda` (the native path
+/// for these NVIDIA rigs) is tried first, then `wgpu` (Vulkan/DX12/Metal/GL,
+/// checkpointed dispatch — no TDR), then `opencl`. Each is fail-closed: on an
+/// EXPLICIT `--gpu-id` an error propagates (exits 1); on auto a `None` falls
+/// through to the next backend / CPU.
 fn try_gpu_backend(gpu_id: Option<usize>) -> Result<Option<Box<dyn Backend>>> {
-    // `gpu_id` is consumed only by the wgpu arm; in a CPU-only / opencl-only build
-    // it is unused — acknowledge it so there's no unused-variable warning.
-    #[cfg(not(feature = "wgpu"))]
+    // `gpu_id` is consumed only by the cuda/wgpu arms; in a CPU-only / opencl-only
+    // build it is unused — acknowledge it so there's no unused-variable warning.
+    #[cfg(not(any(feature = "cuda", feature = "wgpu")))]
     let _ = gpu_id;
+    #[cfg(feature = "cuda")]
+    {
+        match midstate_miner::cuda_backend::CudaBackend::try_new(gpu_id) {
+            Ok(Some(b)) => return Ok(Some(Box::new(b))),
+            Ok(None) => {} // no usable CUDA device — try wgpu (if built) / opencl / CPU
+            Err(e) => {
+                // An EXPLICIT --gpu-id must never silently fall back: a bad index or
+                // an un-initable pinned card / failed self-test is a user error to
+                // surface, not paper over. Propagate it.
+                if gpu_id.is_some() {
+                    return Err(e);
+                }
+                // Auto-select: device init or self-test failure → never mine on a
+                // GPU we couldn't prove bit-exact. Treat as no-GPU, fall through.
+                eprintln!("cuda init/self-test failed: {e}; treating as no-cuda-GPU");
+            }
+        }
+    }
     #[cfg(feature = "wgpu")]
     {
         match midstate_miner::wgpu_backend::WgpuBackend::try_new(gpu_id) {
