@@ -53,6 +53,15 @@ REPO="dangraagu/DGR-Midstate-pool-Public"
 # MODE selects what we run (passed to the binary as --mode) AND which build to
 # fetch. Resolve it from $MODE (env), defaulting to auto. An explicit first-arg
 # build (cpu|gpu) overrides the download choice but MODE still drives --mode.
+# The first positional arg (cpu|gpu) selects the build AND — unless MODE is set
+# explicitly via the env — the run --mode too, so `mine-auto.sh cpu` runs
+# `--mode cpu` (not the default `auto`). An explicit `MODE=...` env still wins.
+if [ -z "${MODE:-}" ]; then
+  case "${1:-}" in
+    cpu)        MODE=cpu ;;
+    gpu|nvidia) MODE=hybrid ;;
+  esac
+fi
 MODE="${MODE:-auto}"
 case "$MODE" in
   cpu|gpu|hybrid|auto) ;;

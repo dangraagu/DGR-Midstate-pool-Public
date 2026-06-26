@@ -4,6 +4,15 @@ All notable changes to **midstate-pool-miner** are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-06-26
+
+### Fixed
+
+- **Launcher `--mode`** — the first build arg now also drives the run mode, so
+  `mine-auto.sh cpu` runs `--mode cpu` (previously it left `--mode` at the default
+  `auto`; with the CPU build that still mined CPU-only, but the mode string was
+  unclear). `gpu` maps to `--mode hybrid`. An explicit `MODE=…` env still wins.
+
 ## [0.1.2] - 2026-06-26
 
 CPU throughput fix — multi-core and multi-rig fleets now land their full hashrate
