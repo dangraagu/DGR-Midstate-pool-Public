@@ -4,6 +4,12 @@ All notable changes to **midstate-pool-miner** are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-06-26
+
+### Added
+
+- **CUDA GPU backend** (`--features cuda`) for NVIDIA CUDA compute-container rigs where Vulkan/OpenCL are unavailable (driver-only). Ported from the OpenCL kernel; bit-exact (golden vectors validated on real hardware), boot self-test fail-closes to CPU, every nonce CPU-re-verified. cudarc dynamic-loading + a committed version-pinned (PTX 7.8) kernel = no CUDA toolkit to build or run. New asset `midstate-miner-linux-gpu-cuda`. Backend preference: cuda > wgpu > opencl > cpu, each fail-closed.
+
 ## [0.1.4] - 2026-06-26
 
 ### Added

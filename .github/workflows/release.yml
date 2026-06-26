@@ -164,6 +164,17 @@ jobs:
           cargo build --release --features wgpu
           cp target/release/midstate-miner dist/midstate-miner-linux-gpu
 
+      # GPU build for NVIDIA CUDA compute containers (rented GPU rigs where
+      # Vulkan/OpenCL aren't available — only the CUDA driver is). cudarc uses
+      # dynamic-loading so this needs NO CUDA toolkit to COMPILE; the committed,
+      # version-pinned (7.8) PTX is baked in and JIT'd by the rig's driver at run
+      # time. Kernel is bit-exact vs the CPU PoW + boot self_test fail-closes +
+      # every nonce is CPU-re-verified, so a bad GPU can't submit an invalid share.
+      - name: Build GPU (cuda)
+        run: |
+          cargo build --release --features cuda
+          cp target/release/midstate-miner dist/midstate-miner-linux-gpu-cuda
+
       # Publish the self-updating launchers as release assets. Existing rigs
       # refresh them by downloading releases/latest/download/mine-auto.{sh,bat}
       # and SHA-verifying it against the release SHA256SUMS (FAIL-CLOSED if the
