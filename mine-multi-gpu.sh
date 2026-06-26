@@ -24,7 +24,9 @@ set -euo pipefail
 #               or ./midstate-miner.exe next to this script, else PATH)
 #   ADDRESS     your Midstate payout address (REQUIRED; or pass as $1)
 #   SHARE_BITS  share-difficulty bits (must match the pool; default 14)
-#   GPUS        force the GPU count (skip autodetect), e.g. GPUS=4
+#   GPU_IDS     force the exact adapter indices to mine (skip autodetect),
+#               space- or comma-separated, e.g. GPU_IDS="0 2" or GPU_IDS=0,2.
+#               For power users who want a specific (or non-Vulkan) adapter set.
 #   CPU_THREADS CPU worker threads for the first (hybrid) process
 #               (default: physical-cores - 2, floored at 1)
 #   LOG_DIR     where per-GPU logs go (default: ./logs-multi-gpu)
@@ -60,21 +62,65 @@ LIVE_SEC="${LIVE_SEC:-10}"
 MAX_BACKOFF="${MAX_BACKOFF:-60}"
 mkdir -p "$LOG_DIR"
 
-# ── Detect the GPU count ────────────────────────────────────────────────
-# Prefer the miner's own enumerator (--list-gpus, authoritative for wgpu:
-# counts exactly the adapters --gpu-id can address); else nvidia-smi; else 1.
-detect_gpus() {
-  if [ -n "${GPUS:-}" ]; then printf '%s\n' "$GPUS"; return; fi
-  local n
-  n="$("$MINER" --list-gpus 2>/dev/null | grep -cE '^[0-9]+:' || true)"
-  if [ "${n:-0}" -gt 0 ] 2>/dev/null; then printf '%s\n' "$n"; return; fi
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    n="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
-    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then printf '%s\n' "$n"; return; fi
+# ── Detect the adapter INDICES to mine (one per PHYSICAL GPU) ────────────
+# CRITICAL: `--list-gpus` prints ONE line per (adapter × backend), so a single
+# physical card shows up as multiple lines — e.g. one RTX 5070 Ti appears as
+# Vulkan + Dx12 + Cpu + Gl = 4 lines. Spawning one process per LINE would run
+# 4 miners on ONE card. Instead we pick exactly ONE line per physical card:
+# the `(Vulkan)` adapter that is NOT a software `[Cpu]` adapter. Each physical
+# NVIDIA card exposes exactly one Vulkan adapter, so the count of such lines ==
+# the physical GPU count, and each line's index is the `--gpu-id` to pin to.
+#
+# Line format (src/wgpu_backend.rs::adapter_line):  `INDEX: name [Type] (Backend)`
+#
+# Emits the chosen adapter indices, one per line. Resolution order:
+#   1. GPU_IDS env override (power users) — exact indices, space/comma sep.
+#   2. --list-gpus Vulkan-and-not-[Cpu] lines — one real index per physical GPU.
+#   3. nvidia-smi -L count N → indices 0..N-1.
+#   4. fallback: single index 0.
+detect_gpu_ids() {
+  # 1. Explicit override.
+  if [ -n "${GPU_IDS:-}" ]; then
+    printf '%s\n' "$GPU_IDS" | tr ',' ' ' | tr ' ' '\n' | grep -E '^[0-9]+$' || true
+    return
   fi
-  printf '%s\n' "1"
+
+  # 2. Parse --list-gpus: keep lines that are (Vulkan) AND not [Cpu], take their
+  #    leading index. One such line per physical NVIDIA card.
+  local listing ids
+  listing="$("$MINER" --list-gpus 2>/dev/null || true)"
+  ids="$(printf '%s\n' "$listing" \
+    | grep -E '^[0-9]+:' \
+    | grep -F '(Vulkan)' \
+    | grep -vF '[Cpu]' \
+    | sed -E 's/^([0-9]+):.*/\1/' \
+    | grep -E '^[0-9]+$' || true)"
+  if [ -n "$ids" ]; then printf '%s\n' "$ids"; return; fi
+
+  # 3. No Vulkan line (non-wgpu binary, or ICD missing): fall back to nvidia-smi
+  #    physical count → indices 0..N-1.
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local n
+    n="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
+    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+      local i=0
+      while [ "$i" -lt "$n" ]; do printf '%s\n' "$i"; i=$(( i + 1 )); done
+      return
+    fi
+  fi
+
+  # 4. Last resort: a single adapter at index 0.
+  printf '%s\n' "0"
 }
-NGPU="$(detect_gpus)"
+
+# Collect the chosen indices into an array.
+declare -a GPU_ID_LIST=()
+while IFS= read -r _gid; do
+  [ -n "$_gid" ] && GPU_ID_LIST+=("$_gid")
+done < <(detect_gpu_ids)
+# Guarantee at least one target.
+if [ "${#GPU_ID_LIST[@]}" -eq 0 ]; then GPU_ID_LIST=(0); fi
+NGPU="${#GPU_ID_LIST[@]}"
 
 # CPU threads for the hybrid (first) process: physical cores - 2, floored at 1.
 default_cpu_threads() {
@@ -86,7 +132,7 @@ default_cpu_threads() {
 }
 CPU_THREADS="${CPU_THREADS:-$(default_cpu_threads)}"
 
-echo "midstate multi-GPU launcher | miner=$MINER | gpus=$NGPU | share_bits=$SHARE_BITS"
+echo "midstate multi-GPU launcher | miner=$MINER | gpus=$NGPU (adapter ids: ${GPU_ID_LIST[*]}) | share_bits=$SHARE_BITS"
 echo "  first GPU runs hybrid (CPU+GPU, cpu_threads=$CPU_THREADS); the rest run gpu-only"
 echo "  per-GPU logs in: $LOG_DIR"
 
@@ -96,12 +142,14 @@ echo "  per-GPU logs in: $LOG_DIR"
 declare -a PIDS=()
 
 run_one_gpu() {
-  local idx="$1"
-  local log="$LOG_DIR/gpu-$idx.log"
+  local slot="$1"   # position in GPU_ID_LIST (0 = first → hybrid)
+  local gid="$2"    # the REAL adapter index passed to --gpu-id
+  local log="$LOG_DIR/gpu-$gid.log"
   local backoff=5
-  # The first process also mines on the CPU (hybrid); the rest are GPU-only.
+  # The FIRST process (slot 0) also mines on the CPU (hybrid); the rest are
+  # GPU-only. (slot, not gid: the first physical card may have any adapter index.)
   local mode_args
-  if [ "$idx" -eq 0 ]; then
+  if [ "$slot" -eq 0 ]; then
     mode_args=(--mode hybrid --cpu-threads "$CPU_THREADS")
   else
     mode_args=(--mode gpu)
@@ -109,11 +157,11 @@ run_one_gpu() {
   while true; do
     local started ended
     started="$(date +%s)"
-    echo "[gpu $idx] starting: $MINER --address <addr> --gpu-id $idx --share-bits $SHARE_BITS ${mode_args[*]}" \
+    echo "[gpu $gid] starting: $MINER --address <addr> --gpu-id $gid --share-bits $SHARE_BITS ${mode_args[*]}" \
       | tee -a "$log"
     "$MINER" \
       --address "$ADDRESS" \
-      --gpu-id "$idx" \
+      --gpu-id "$gid" \
       --share-bits "$SHARE_BITS" \
       "${mode_args[@]}" \
       >>"$log" 2>&1 || true
@@ -122,7 +170,7 @@ run_one_gpu() {
     if [ $(( ended - started )) -ge 60 ]; then
       backoff=5
     fi
-    echo "[gpu $idx] exited; restarting in ${backoff}s" | tee -a "$log"
+    echo "[gpu $gid] exited; restarting in ${backoff}s" | tee -a "$log"
     sleep "$backoff"
     backoff=$(( backoff * 3 ))
     if [ "$backoff" -gt "$MAX_BACKOFF" ]; then backoff="$MAX_BACKOFF"; fi
@@ -142,15 +190,15 @@ stop_all() {
 }
 trap stop_all INT TERM EXIT
 
-# Launch one supervisor per GPU.
-i=0
-while [ "$i" -lt "$NGPU" ]; do
-  run_one_gpu "$i" &
+# Launch one supervisor per PHYSICAL GPU (slot = position, gid = real adapter index).
+slot=0
+for gid in "${GPU_ID_LIST[@]}"; do
+  run_one_gpu "$slot" "$gid" &
   PIDS+=("$!")
-  i=$(( i + 1 ))
+  slot=$(( slot + 1 ))
 done
 
-echo "launched $NGPU GPU miner supervisor(s). Ctrl+C to stop all."
+echo "launched $NGPU GPU miner supervisor(s) on adapter id(s): ${GPU_ID_LIST[*]}. Ctrl+C to stop all."
 
 # ── Liveness watch: if any supervisor dies (it shouldn't — it self-restarts),
 # log it. The supervisors own per-GPU restart; this is the top-level heartbeat.

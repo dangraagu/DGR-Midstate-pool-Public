@@ -460,6 +460,18 @@ pub fn list_adapters() -> Vec<String> {
 async fn pick_adapter(instance: &wgpu::Instance, gpu_id: Option<usize>) -> Result<wgpu::Adapter> {
     let mut adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
     if adapters.is_empty() {
+        // An EXPLICIT --gpu-id must fail LOUDLY: the user pinned a card, so a
+        // silent CPU fallback would mine the wrong thing without telling them.
+        // Use a message that does NOT contain "no GPU adapters" / "only software"
+        // so `try_new` does NOT map it to Ok(None) — it propagates as Err and the
+        // gpu_id arm in `try_gpu_backend` exits 1. (gpu_id=None keeps the
+        // auto-fallback message below, which IS mapped to Ok(None) → CPU.)
+        if gpu_id.is_some() {
+            bail!(
+                "--gpu-id requested but no GPU adapter is available (Vulkan ICD missing?). \
+                 wgpu uses Vulkan/DX12/Metal/GL, not CUDA — verify with `vulkaninfo --summary`."
+            );
+        }
         bail!(
             "no GPU adapters found. wgpu uses Vulkan/DX12/Metal/GL, not CUDA — an NVIDIA \
              card needs its Vulkan ICD installed (verify with `vulkaninfo --summary`)."

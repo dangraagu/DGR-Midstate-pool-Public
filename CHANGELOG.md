@@ -30,6 +30,39 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   OpenCL toolkit, and the checkpointed dispatch avoids the desktop GPU watchdog.
   The CPU builds are unchanged.
 
+## [0.1.3] - 2026-06-26
+
+### Fixed
+
+- **Launcher `--mode`** — the first build arg now also drives the run mode, so
+  `mine-auto.sh cpu` runs `--mode cpu` (previously it left `--mode` at the default
+  `auto`; with the CPU build that still mined CPU-only, but the mode string was
+  unclear). `gpu` maps to `--mode hybrid`. An explicit `MODE=…` env still wins.
+
+## [0.1.2] - 2026-06-26
+
+CPU throughput fix — multi-core and multi-rig fleets now land their full hashrate
+instead of colliding and wasting work.
+
+### Fixed
+
+- **Fleet nonce collision** — every rig previously started (and reset on each new
+  job) its nonce search at 0, so a whole fleet ground identical nonces and all but
+  the first submitter got "Duplicate share." Each rig now seeds a per-instance
+  random nonce base (OS entropy) and advances continuously, never resetting to 0.
+- **Job-roll waste** — the per-search window was `threads × 128` nonces, which at
+  high thread counts blocked for seconds and never finished before the pool rolled
+  the job (restarting at the low nonces). The window is now `threads × 4`
+  (sub-second), so the loop stays responsive to new jobs.
+- **CPU thread cap** — CPU-only mining was clamped to *physical* cores, so a rented
+  vCPU box ran ~half its threads. CPU-only now uses *logical* cores and honors a
+  `--cpu-threads` override above physical. GPU/hybrid keep the physical-minus-2 rule.
+
+### Changed
+
+- **Default `--share-bits` is now 14** (was 20) to match the pool's share
+  difficulty, so the launcher and bare runs gate correctly without an explicit flag.
+
 ## [0.1.1] - 2026-06-25
 
 First public release — prebuilt, SHA-256-verified binaries for Windows, Linux,
@@ -77,4 +110,6 @@ launcher.
   reject pattern, fall back to `--mode cpu` and report it.
 
 [0.1.4]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.4
+[0.1.3]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.3
+[0.1.2]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.2
 [0.1.1]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.1
