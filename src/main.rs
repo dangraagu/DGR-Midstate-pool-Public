@@ -31,8 +31,8 @@ struct Cli {
     /// Deprecated alias for `--mode cpu` (kept for older launchers/scripts).
     #[arg(long, default_value_t = false)]
     cpu: bool,
-    /// Share-difficulty bits to gate at (must match the pool; default 20).
-    #[arg(long, default_value_t = 20)]
+    /// Share-difficulty bits to gate at (must match the pool; default 14).
+    #[arg(long, default_value_t = 14)]
     share_bits: u32,
     /// Stop after N seconds (0 = run forever).
     #[arg(long, default_value_t = 0)]

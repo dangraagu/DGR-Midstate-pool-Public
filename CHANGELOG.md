@@ -4,6 +4,30 @@ All notable changes to **midstate-pool-miner** are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-06-26
+
+CPU throughput fix — multi-core and multi-rig fleets now land their full hashrate
+instead of colliding and wasting work.
+
+### Fixed
+
+- **Fleet nonce collision** — every rig previously started (and reset on each new
+  job) its nonce search at 0, so a whole fleet ground identical nonces and all but
+  the first submitter got "Duplicate share." Each rig now seeds a per-instance
+  random nonce base (OS entropy) and advances continuously, never resetting to 0.
+- **Job-roll waste** — the per-search window was `threads × 128` nonces, which at
+  high thread counts blocked for seconds and never finished before the pool rolled
+  the job (restarting at the low nonces). The window is now `threads × 4`
+  (sub-second), so the loop stays responsive to new jobs.
+- **CPU thread cap** — CPU-only mining was clamped to *physical* cores, so a rented
+  vCPU box ran ~half its threads. CPU-only now uses *logical* cores and honors a
+  `--cpu-threads` override above physical. GPU/hybrid keep the physical-minus-2 rule.
+
+### Changed
+
+- **Default `--share-bits` is now 14** (was 20) to match the pool's share
+  difficulty, so the launcher and bare runs gate correctly without an explicit flag.
+
 ## [0.1.1] - 2026-06-25
 
 First public release — prebuilt, SHA-256-verified binaries for Windows, Linux,
