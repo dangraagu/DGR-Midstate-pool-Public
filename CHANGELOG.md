@@ -4,6 +4,14 @@ All notable changes to **midstate-pool-miner** are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-06-29
+
+### Added
+
+- **`midstate-dashboard.sh` / `midstate-dashboard.bat`** — a read-only terminal
+  dashboard that polls the public pool per-address API (works with the v0.1.6
+  fleet; opt-in). No miner/consensus change.
+
 ## [0.1.6] - 2026-06-29
 
 ### Added

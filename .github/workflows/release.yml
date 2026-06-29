@@ -210,6 +210,22 @@ jobs:
             echo "::warning::mine-auto.sh / mine-auto.bat not found in repo root — self-update launchers will NOT be published this release."
           fi
 
+      # Terminal dashboard (read-only viewer that polls the PUBLIC pool per-address
+      # API). Staged in the SAME job whose dist/ the single release job flattens +
+      # checksums, so both files land in SHA256SUMS like the other assets — which
+      # is what the dashboards' own fail-closed SHA-verified self-update verifies a
+      # downloaded copy against. Both files are guarded with `if [ -f ... ]`; a
+      # missing file is a warning, not a hard failure.
+      - name: Stage terminal dashboard (midstate-dashboard.sh / midstate-dashboard.bat)
+        run: |
+          set -euo pipefail
+          if [ -f midstate-dashboard.sh ] && [ -f midstate-dashboard.bat ]; then
+            cp midstate-dashboard.sh midstate-dashboard.bat dist/
+            echo "staged dashboard:"; ls -1 dist/midstate-dashboard.sh dist/midstate-dashboard.bat
+          else
+            echo "::warning::midstate-dashboard.sh / midstate-dashboard.bat not found in repo root — terminal dashboard will NOT be published this release."
+          fi
+
       # Multi-GPU launcher (one midstate-miner process per GPU via --gpu-id). Staged
       # in the SAME job whose dist/ the single release job flattens + checksums, so
       # it lands in SHA256SUMS like the other assets. Not self-updating (operators
