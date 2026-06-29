@@ -91,7 +91,19 @@ if [ -z "$VARIANT" ]; then
   case "$MODE" in
     cpu) VARIANT="cpu" ;;
     gpu|hybrid) VARIANT="gpu" ;;
-    auto) if gpu_detected; then VARIANT="gpu"; else VARIANT="cpu"; fi ;;
+    # auto: NVIDIA -> the CUDA build (fastest); any other GPU -> the OpenCL/wgpu
+    # gpu build; no GPU -> cpu. Mirrors install-midstate-miner.sh + mine-auto.bat
+    # so `auto` (the default) is CUDA-default on NVIDIA. The gpu-cuda -> gpu -> cpu
+    # fail-closed fallback below covers a missing cuda asset or a driver that
+    # cannot init, so auto-preferring cuda never bricks.
+    auto)
+      if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+        VARIANT="gpu-cuda"
+      elif gpu_detected; then
+        VARIANT="gpu"
+      else
+        VARIANT="cpu"
+      fi ;;
   esac
 fi
 case "$VARIANT" in
