@@ -29,22 +29,34 @@ echo  === Midstate Pool Miner installer ===
 echo(
 
 REM --- 1. Pick the build variant (arg overrides auto-detect) ---
-REM A GPU (NVIDIA/AMD/Intel Arc) selects the gpu build (OpenCL/hybrid). The gpu
-REM build still runs CPU-only at runtime if no OpenCL device is found. MODE
-REM (default auto) is passed through to mine-auto.bat at the end.
+REM An NVIDIA card PREFERS the native CUDA build (gpu-cuda, fastest; JITs the
+REM committed PTX via the driver, no toolkit); any other GPU vendor (AMD/Intel Arc)
+REM selects the OpenCL gpu build; no GPU -> cpu. Every GPU build still runs CPU-only
+REM at runtime if no device is found, and the download below falls back
+REM gpu-cuda -> gpu -> cpu on a missing asset. MODE (default auto) is passed through
+REM to mine-auto.bat at the end.
 if not defined MODE set "MODE=auto"
 set "VARIANT=%~1"
 if not defined VARIANT (
   REM Pipe-free PowerShell (no '|' to mis-escape inside the for/f backticks):
-  REM use .Name instead of "| Select-Object". A GPU vendor -> gpu, else cpu.
-  for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$n=((Get-CimInstance Win32_VideoController).Name -join ','); if ($n -match 'NVIDIA|AMD|Radeon|Intel\(R\) Arc'){'gpu'} else {'cpu'}"`) do set "VARIANT=%%i"
+  REM use .Name instead of "| Select-Object". NVIDIA (nvidia-smi OR an NVIDIA
+  REM controller) -> gpu-cuda; other GPU vendor -> gpu; else cpu.
+  for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$nv=$false; try { if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { $nv=$true } } catch {}; $n=((Get-CimInstance Win32_VideoController).Name -join ','); if ($nv -or $n -match 'NVIDIA'){'gpu-cuda'} elseif ($n -match 'AMD|Radeon|Intel\(R\) Arc'){'gpu'} else {'cpu'}"`) do set "VARIANT=%%i"
 )
 if not defined VARIANT set "VARIANT=cpu"
-REM Back-compat: an old 'nvidia' arg maps to the gpu build.
-if /i "%VARIANT%"=="nvidia" set "VARIANT=gpu"
+REM Back-compat: an old 'nvidia' arg now maps to the CUDA build (preferred NVIDIA
+REM path); 'cuda' is an explicit alias for the same.
+if /i "%VARIANT%"=="nvidia" set "VARIANT=gpu-cuda"
+if /i "%VARIANT%"=="cuda" set "VARIANT=gpu-cuda"
+if /i not "%VARIANT%"=="cpu" if /i not "%VARIANT%"=="gpu" if /i not "%VARIANT%"=="gpu-cuda" (
+  echo [X] Unknown build "%VARIANT%". Use one of: gpu-cuda ^| gpu ^| cpu
+  pause & exit /b 1
+)
 echo Selected build: %VARIANT%  (mode=%MODE%)
 
-if /i "%VARIANT%"=="cpu" ( set "EXE=midstate-miner.exe" ) else ( set "EXE=midstate-miner-gpu.exe" )
+if /i "%VARIANT%"=="cpu" ( set "EXE=midstate-miner.exe"
+) else if /i "%VARIANT%"=="gpu-cuda" ( set "EXE=midstate-miner-gpu-cuda.exe"
+) else ( set "EXE=midstate-miner-gpu.exe" )
 set "BIN=%DIR%\%EXE%"
 set "URL=https://github.com/%REPO%/releases/latest/download/%EXE%"
 
@@ -63,12 +75,37 @@ if !errorlevel!==0 (
 )
 
 REM --- 3. Download the matching miner ---
+REM FALLBACK CHAIN (mirrors mine-auto.bat / install-midstate-miner.sh): if the
+REM selected asset 404s / fails, step DOWN to the next-best ALWAYS-published build so
+REM an NVIDIA rig is never stranded on a missing asset: gpu-cuda -> gpu -> cpu.
+REM Each step re-points EXE/BIN/URL before the SHA verify below tracks the same
+REM build. Fail-closed: only the FINAL cpu failure aborts the install.
 echo Downloading %EXE% ...
-where curl >nul 2>&1
-if !errorlevel!==0 (
-  curl -L -f -o "%BIN%" "%URL%"
-) else (
-  powershell -NoProfile -Command "try { Invoke-WebRequest -Uri '%URL%' -OutFile '%BIN%' -UseBasicParsing } catch { exit 1 }"
+call :dl_one
+if !errorlevel! NEQ 0 (
+  if /i "%VARIANT%"=="gpu-cuda" (
+    echo [!] 'gpu-cuda' build unavailable - falling back to the OpenCL gpu build.
+    set "VARIANT=gpu"
+    set "EXE=midstate-miner-gpu.exe"
+    set "BIN=%DIR%\midstate-miner-gpu.exe"
+    set "URL=https://github.com/%REPO%/releases/latest/download/midstate-miner-gpu.exe"
+    echo Downloading !EXE! ...
+    call :dl_one
+  )
+)
+if !errorlevel! NEQ 0 (
+  if /i not "%VARIANT%"=="cpu" (
+    echo [!] '%VARIANT%' build unavailable - falling back to the cpu build.
+    set "VARIANT=cpu"
+    set "EXE=midstate-miner.exe"
+    set "BIN=%DIR%\midstate-miner.exe"
+    set "URL=https://github.com/%REPO%/releases/latest/download/midstate-miner.exe"
+    REM The CPU binary rejects --mode gpu/hybrid; downgrade so it mines on CPU.
+    if /i "%MODE%"=="gpu" set "MODE=auto"
+    if /i "%MODE%"=="hybrid" set "MODE=auto"
+    echo Downloading !EXE! ...
+    call :dl_one
+  )
 )
 if !errorlevel! NEQ 0 (
   echo(
@@ -198,3 +235,21 @@ if exist "%~dp0mine-auto.bat" (
   pause
 )
 endlocal
+exit /b 0
+
+REM ============================================================
+REM  Subroutines
+REM ============================================================
+
+REM Download %URL% -> %BIN% using curl (preferred) or PowerShell, returning the
+REM tool's exit code so the fallback chain above can step down on a 404/failure.
+REM Used for the gpu-cuda -> gpu -> cpu asset fallback. Note: a `goto :eof` / RETURN
+REM here propagates the LAST command's errorlevel to the caller's `if errorlevel`.
+:dl_one
+where curl >nul 2>&1
+if !errorlevel!==0 (
+  curl -L -f -o "%BIN%" "%URL%"
+) else (
+  powershell -NoProfile -Command "try { Invoke-WebRequest -Uri '%URL%' -OutFile '%BIN%' -UseBasicParsing } catch { exit 1 }"
+)
+goto :eof

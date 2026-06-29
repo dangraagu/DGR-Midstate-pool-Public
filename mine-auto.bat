@@ -34,9 +34,13 @@ REM   * Liveness is checked on a SHORT cadence (LIVE_SEC),
 REM     decoupled from the slow update poll, with ESCALATING
 REM     BACKOFF so a crash-looping rig doesn't hammer.
 REM  MODE (cpu^|gpu^|hybrid^|auto, default auto) picks which build to download AND
-REM  which --mode to run. `auto` auto-detects a GPU: present -^> GPU build (runs
-REM  hybrid CPU+GPU), else the CPU build. Force a build via the first arg (cpu^|gpu):
+REM  which --mode to run. `auto` auto-detects a GPU: an NVIDIA card -^> the native
+REM  CUDA build (midstate-miner-gpu-cuda.exe, fastest; JITs the committed PTX via
+REM  the driver, no toolkit), any other GPU -^> the OpenCL gpu build, else the CPU
+REM  build. The updater falls back gpu-cuda -^> gpu -^> cpu if an asset is missing.
+REM  Force a build via the first arg (cpu^|gpu^|gpu-cuda):
 REM     set MODE=hybrid ^& mine-auto.bat      (GPU build, hybrid CPU+GPU)
+REM     mine-auto.bat gpu-cuda               (force the native CUDA build)
 REM     mine-auto.bat cpu                     (force the CPU build)
 REM
 REM  Env knobs (all optional):
@@ -58,31 +62,39 @@ if /i not "%MODE%"=="cpu" if /i not "%MODE%"=="gpu" if /i not "%MODE%"=="hybrid"
   pause & exit /b 1
 )
 
-REM Which BUILD to fetch: first arg wins (cpu^|gpu); else derive from MODE; for
-REM auto, detect an NVIDIA/OpenCL GPU and pick the gpu build if present. The gpu
-REM build still runs CPU-only if no device is found at runtime (degrades), and the
-REM updater falls back to the cpu asset if the gpu asset is missing - never a brick.
+REM Which BUILD to fetch: first arg wins (cpu^|gpu^|gpu-cuda); else derive from MODE;
+REM for auto, probe the GPU and PREFER the native CUDA build on an NVIDIA card. The
+REM CUDA build (midstate-miner-gpu-cuda.exe) JITs the committed PTX via the NVIDIA
+REM driver (nvcuda.dll) - no CUDA toolkit - and is markedly faster than OpenCL on
+REM NVIDIA; a non-NVIDIA GPU (AMD/Intel) keeps the OpenCL gpu build. Every GPU build
+REM still runs CPU-only if no device is found at runtime (degrades), and the updater
+REM falls back gpu-cuda -^> gpu -^> cpu on a missing/unverified asset - never a brick.
 set "VARIANT=%~1"
 if not defined VARIANT (
   if /i "%MODE%"=="cpu" ( set "VARIANT=cpu"
   ) else if /i "%MODE%"=="gpu" ( set "VARIANT=gpu"
   ) else if /i "%MODE%"=="hybrid" ( set "VARIANT=gpu"
   ) else (
-    REM auto: probe for a GPU (NVIDIA name match is a good proxy; any GPU vendor
-    REM with an OpenCL ICD also works at runtime). Default cpu on no/false detect.
+    REM auto: probe for a GPU. NVIDIA (nvidia-smi OR an NVIDIA video controller, the
+    REM nvcuda.dll path) -^> gpu-cuda (fastest); any other GPU vendor with an OpenCL
+    REM ICD -^> gpu; nothing -^> cpu. Default cpu on no/false detect.
     set "VARIANT=cpu"
-    for /f "usebackq delims=" %%g in (`powershell -NoProfile -Command "$n=((Get-CimInstance Win32_VideoController).Name -join ','); if ($n -match 'NVIDIA|AMD|Radeon|Intel\(R\) Arc'){'gpu'} else {'cpu'}"`) do set "VARIANT=%%g"
+    for /f "usebackq delims=" %%g in (`powershell -NoProfile -Command "$nv=$false; try { if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { $nv=$true } } catch {}; $n=((Get-CimInstance Win32_VideoController).Name -join ','); if ($nv -or $n -match 'NVIDIA'){'gpu-cuda'} elseif ($n -match 'AMD|Radeon|Intel\(R\) Arc'){'gpu'} else {'cpu'}"`) do set "VARIANT=%%g"
   )
 )
-REM Back-compat: an old caller passing 'nvidia' maps to the gpu build.
-if /i "%VARIANT%"=="nvidia" set "VARIANT=gpu"
-if /i not "%VARIANT%"=="cpu" if /i not "%VARIANT%"=="gpu" (
-  echo [X] Unknown build "%VARIANT%". Use one of: gpu ^| cpu
+REM Back-compat: an old caller passing 'nvidia' now maps to the CUDA build (the
+REM preferred NVIDIA path); 'cuda' is an explicit alias for the same.
+if /i "%VARIANT%"=="nvidia" set "VARIANT=gpu-cuda"
+if /i "%VARIANT%"=="cuda" set "VARIANT=gpu-cuda"
+if /i not "%VARIANT%"=="cpu" if /i not "%VARIANT%"=="gpu" if /i not "%VARIANT%"=="gpu-cuda" (
+  echo [X] Unknown build "%VARIANT%". Use one of: gpu-cuda ^| gpu ^| cpu
   pause & exit /b 1
 )
 
 set "DIR=%LOCALAPPDATA%\midstate-miner"
-if /i "%VARIANT%"=="cpu" ( set "EXE=midstate-miner.exe" ) else ( set "EXE=midstate-miner-gpu.exe" )
+if /i "%VARIANT%"=="cpu" ( set "EXE=midstate-miner.exe"
+) else if /i "%VARIANT%"=="gpu-cuda" ( set "EXE=midstate-miner-gpu-cuda.exe"
+) else ( set "EXE=midstate-miner-gpu.exe" )
 set "BIN=%DIR%\%EXE%"
 set "CFG=%DIR%\address.txt"
 if not defined CHECK_MIN set "CHECK_MIN=15"
@@ -308,17 +320,33 @@ if "!DOUPDATE!"=="0" goto :eof
 echo [%time%] update: !INSTALLED! -^> !LATEST!  ^(verify, then swap + restart^)
 
 REM 1. Download the new binary to a TEMP path - NEVER onto the live %BIN%.
-REM    CPU-FALLBACK (mirrors mine-auto.sh download_verify_swap): if a non-cpu
-REM    (nvidia) asset 404s / fails to download, re-point EXE/BIN to the CPU build
-REM    (midstate-miner.exe, always published) and download THAT instead, so a
-REM    Windows rig is NEVER stranded on a missing GPU asset. The re-point updates
-REM    VARIANT/EXE/BIN before the SHA lookup + swap below, so the SHA256SUMS key
-REM    (%EXE%), the staged temp (%BIN%.new), and the final swap (%BIN%) all track
-REM    cpu from here on. Brick-safe: still a TEMP-path download, fail-closed if
-REM    even the cpu download fails (keep the running binary, retry next poll).
+REM    FALLBACK CHAIN (mirrors mine-auto.sh / install-midstate-miner.sh): if the
+REM    selected asset 404s / fails to download, step DOWN to the next-best build that
+REM    is always published, so a Windows rig is NEVER stranded on a missing asset:
+REM       gpu-cuda  ->  gpu (OpenCL)  ->  cpu
+REM       gpu       ->  cpu
+REM    Each re-point updates VARIANT/EXE/BIN/NEWBIN BEFORE the SHA lookup + swap
+REM    below, so the SHA256SUMS key (%EXE%), the staged temp (%BIN%.new), and the
+REM    final swap (%BIN%) all track the fallback build. Brick-safe: still a TEMP-path
+REM    download, fail-closed if even the cpu download fails (keep the running binary,
+REM    retry next poll). NOTE: gpu-cuda -> gpu keeps a real GPU --mode (gpu/hybrid)
+REM    since the OpenCL build still drives the GPU; only the final ->cpu step
+REM    downgrades an explicit GPU mode to auto (the CPU binary rejects --mode gpu).
 set "NEWBIN=%BIN%.new"
 if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
 curl -L -f -o "!NEWBIN!" "https://github.com/%REPO%/releases/latest/download/%EXE%"
+if not !errorlevel!==0 (
+  if /i "%VARIANT%"=="gpu-cuda" (
+    echo [%time%] [!] 'gpu-cuda' build unavailable ^(download failed / 404^). Falling back to the OpenCL gpu build.
+    if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
+    set "VARIANT=gpu"
+    set "EXE=midstate-miner-gpu.exe"
+    set "BIN=%DIR%\midstate-miner-gpu.exe"
+    set "NEWBIN=%DIR%\midstate-miner-gpu.exe.new"
+    if exist "!NEWBIN!" del /f /q "!NEWBIN!" >nul 2>&1
+    curl -L -f -o "!NEWBIN!" "https://github.com/%REPO%/releases/latest/download/midstate-miner-gpu.exe"
+  )
+)
 if not !errorlevel!==0 (
   if /i not "%VARIANT%"=="cpu" (
     echo [%time%] [!] '%VARIANT%' build unavailable ^(download failed / 404^). Falling back to the cpu build.

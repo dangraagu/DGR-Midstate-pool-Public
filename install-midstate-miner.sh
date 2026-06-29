@@ -65,8 +65,14 @@ esac
 
 VARIANT="${1:-}"
 if [ -z "$VARIANT" ]; then
+  # PREFER CUDA on an NVIDIA host. The native CUDA build (one process per card,
+  # JIT'd from the committed PTX, no toolkit) is markedly faster than the OpenCL/
+  # wgpu path on NVIDIA, so when the NVIDIA driver is present we pick gpu-cuda and
+  # let the download step fall back to the plain gpu (OpenCL/wgpu) asset if the
+  # cuda asset isn't published for this platform (it is Linux-only). A non-NVIDIA
+  # GPU (AMD/Intel ICD) keeps the OpenCL/wgpu gpu build; no GPU => cpu.
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-    VARIANT="gpu"
+    VARIANT="gpu-cuda"
   elif command -v clinfo >/dev/null 2>&1 && clinfo 2>/dev/null | grep -qi 'Device Name'; then
     VARIANT="gpu"
   elif ls /etc/OpenCL/vendors/*.icd >/dev/null 2>&1; then
@@ -77,10 +83,11 @@ if [ -z "$VARIANT" ]; then
 fi
 
 case "$VARIANT" in
-  gpu|cpu) ;;
-  nvidia) VARIANT="gpu" ;;  # back-compat alias
+  gpu|gpu-cuda|cpu) ;;
+  cuda) VARIANT="gpu-cuda" ;;  # convenience alias for an explicit CUDA build
+  nvidia) VARIANT="gpu-cuda" ;;  # back-compat alias: nvidia => prefer CUDA now
   *)
-    echo "[X] Unknown build '$VARIANT'. Use one of: gpu | cpu" >&2
+    echo "[X] Unknown build '$VARIANT'. Use one of: gpu-cuda | gpu | cpu" >&2
     exit 1
     ;;
 esac
@@ -88,6 +95,11 @@ echo "Selected build: $VARIANT  (mode=$MODE)"
 
 # Print the relevant prerequisite hint.
 case "$VARIANT" in
+  gpu-cuda)
+    echo "  -> CUDA build (NVIDIA, fastest): needs only the NVIDIA driver (libcuda);"
+    echo "     no CUDA toolkit (the kernel PTX is baked in + JIT'd by the driver)."
+    echo "     Falls back to the OpenCL/wgpu GPU build if the cuda asset is missing."
+    ;;
   gpu)
     echo "  -> GPU build: needs an OpenCL runtime/ICD for your GPU (NVIDIA driver,"
     echo "     AMD/Intel OpenCL, etc.). Runs CPU-only if no device is found."
@@ -104,65 +116,93 @@ case "$(uname -s 2>/dev/null)" in
   Darwin) PLATFORM="macos" ;;
   *)      PLATFORM="linux" ;;
 esac
-if [ "$VARIANT" = "cpu" ]; then
-  BIN_NAME="midstate-miner-$PLATFORM"
-else
-  BIN_NAME="midstate-miner-$PLATFORM-gpu"
-fi
+# Map the chosen VARIANT to the release asset basename. The CUDA build ships as
+# `…-gpu-cuda` (Linux only; one process per card, JIT'd from the committed PTX).
+# `gpu-cuda` falls back to the plain `…-gpu` (OpenCL/wgpu) asset if the cuda asset
+# isn't published for this platform — so an NVIDIA rig still gets a working GPU
+# build instead of failing the install.
+case "$VARIANT" in
+  cpu)      BIN_NAME="midstate-miner-$PLATFORM" ;;
+  gpu)      BIN_NAME="midstate-miner-$PLATFORM-gpu" ;;
+  gpu-cuda) BIN_NAME="midstate-miner-$PLATFORM-gpu-cuda" ;;
+esac
+
+# --- 2. Download + verify the matching miner (SHA-256, fail-closed) ----------
+# `fetch_and_verify <asset_basename>` downloads the asset to $BIN and verifies it
+# against the release SHA256SUMS. Defence in depth on the FIRST fetch (TLS already
+# authenticates the GitHub CDN, but this also catches a truncated/tampered asset).
+# FAIL CLOSED: any download/verify failure removes $BIN and returns non-zero —
+# nothing is running yet, so aborting can never brick a rig. SHA256SUMS line
+# format is `<hex>  <filename>` (sha256sum style); we match the basename exactly.
+fetch_and_verify() {
+  local name="$1"
+  local url="https://github.com/$REPO/releases/latest/download/$name"
+  echo "Downloading $name ..."
+  if ! download "$url" "$BIN"; then
+    return 1
+  fi
+  echo "Verifying $name against the release SHA256SUMS ..."
+  local sums="$DATA_DIR/SHA256SUMS.install"
+  if ! download "https://github.com/$REPO/releases/latest/download/SHA256SUMS" "$sums" 2>/dev/null; then
+    rm -f "$BIN"
+    echo "[X] Could not fetch SHA256SUMS - refusing to install an unverified binary." >&2
+    return 1
+  fi
+  local want
+  want="$(awk -v a="$name" '$2==a || $2=="*"a {print $1; exit}' "$sums")"
+  rm -f "$sums"
+  if [ -z "$want" ]; then
+    rm -f "$BIN"
+    echo "[!] '$name' is not listed in SHA256SUMS." >&2
+    return 1
+  fi
+  local got
+  if command -v sha256sum >/dev/null 2>&1; then
+    got="$(sha256sum "$BIN" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    got="$(shasum -a 256 "$BIN" | awk '{print $1}')"  # macOS ships shasum
+  else
+    rm -f "$BIN"
+    echo "[X] No sha256sum/shasum available to verify the download - refusing (fail-closed)." >&2
+    return 1
+  fi
+  if [ "$got" != "$want" ]; then
+    rm -f "$BIN"
+    echo "[X] SHA-256 verify FAILED for $name (got $got, want $want) - aborting." >&2
+    return 1
+  fi
+  echo "  -> verified ($want)."
+  return 0
+}
+
 BIN="$DATA_DIR/$BIN_NAME"
-URL="https://github.com/$REPO/releases/latest/download/$BIN_NAME"
-
-# --- 2. Download the matching miner ----------------------------------------
 echo
-echo "Downloading $BIN_NAME ..."
-if ! download "$URL" "$BIN"; then
-  echo
-  echo "[X] Download failed. Either no release is published yet, the"
-  echo "    '$VARIANT' build isn't in the latest release, or no network."
-  echo "    Releases: https://github.com/$REPO/releases/latest"
-  echo "    Tip: try another build, e.g.  ./install-midstate-miner.sh cpu"
-  echo
-  exit 1
+if ! fetch_and_verify "$BIN_NAME"; then
+  # CUDA asset missing/unverifiable → fall back to the plain GPU (OpenCL/wgpu)
+  # build, which is published for every OS. Keeps an NVIDIA rig mining (slower
+  # path) instead of refusing the install. Any other variant just aborts.
+  if [ "$VARIANT" = "gpu-cuda" ]; then
+    echo "[!] CUDA build unavailable - falling back to the OpenCL/wgpu GPU build."
+    VARIANT="gpu"
+    BIN_NAME="midstate-miner-$PLATFORM-gpu"
+    BIN="$DATA_DIR/$BIN_NAME"
+    if ! fetch_and_verify "$BIN_NAME"; then
+      echo
+      echo "[X] GPU build download/verify failed too. No usable release asset." >&2
+      echo "    Releases: https://github.com/$REPO/releases/latest" >&2
+      echo "    Tip: try another build, e.g.  ./install-midstate-miner.sh cpu" >&2
+      exit 1
+    fi
+  else
+    echo
+    echo "[X] Download/verify failed. Either no release is published yet, the"
+    echo "    '$VARIANT' build isn't in the latest release, or no network."
+    echo "    Releases: https://github.com/$REPO/releases/latest"
+    echo "    Tip: try another build, e.g.  ./install-midstate-miner.sh cpu"
+    echo
+    exit 1
+  fi
 fi
-
-# --- 2a. Verify the downloaded binary against the release SHA256SUMS --------
-# Defence in depth on the FIRST fetch (TLS already authenticates the GitHub CDN,
-# but this also catches a truncated download / a tampered asset). FAIL CLOSED:
-# any missing checksums file, missing entry, missing verifier, or hash mismatch
-# removes the unverified binary and aborts the install. Nothing is running yet,
-# so aborting can never brick a rig. The SHA256SUMS line format is
-# `<hex>  <filename>` (sha256sum style); we match $BIN_NAME exactly.
-echo "Verifying $BIN_NAME against the release SHA256SUMS ..."
-SUMS_TMP="$DATA_DIR/SHA256SUMS.install"
-if ! download "https://github.com/$REPO/releases/latest/download/SHA256SUMS" "$SUMS_TMP" 2>/dev/null; then
-  rm -f "$BIN"
-  echo "[X] Could not fetch SHA256SUMS - refusing to install an unverified binary." >&2
-  echo "    Releases: https://github.com/$REPO/releases/latest" >&2
-  exit 1
-fi
-WANT="$(awk -v a="$BIN_NAME" '$2==a || $2=="*"a {print $1; exit}' "$SUMS_TMP")"
-rm -f "$SUMS_TMP"
-if [ -z "$WANT" ]; then
-  rm -f "$BIN"
-  echo "[X] '$BIN_NAME' is not listed in SHA256SUMS - refusing the install (fail-closed)." >&2
-  exit 1
-fi
-if command -v sha256sum >/dev/null 2>&1; then
-  GOT="$(sha256sum "$BIN" | awk '{print $1}')"
-elif command -v shasum >/dev/null 2>&1; then
-  # macOS ships `shasum` (not `sha256sum`).
-  GOT="$(shasum -a 256 "$BIN" | awk '{print $1}')"
-else
-  rm -f "$BIN"
-  echo "[X] No sha256sum/shasum available to verify the download - refusing (fail-closed)." >&2
-  exit 1
-fi
-if [ "$GOT" != "$WANT" ]; then
-  rm -f "$BIN"
-  echo "[X] SHA-256 verify FAILED for $BIN_NAME (got $GOT, want $WANT) - aborting install." >&2
-  exit 1
-fi
-echo "  -> verified ($WANT)."
 chmod +x "$BIN"
 
 # --- 2b. Also fetch the auto-update launcher next to this file -------------

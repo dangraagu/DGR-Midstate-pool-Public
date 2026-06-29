@@ -95,10 +95,10 @@ if [ -z "$VARIANT" ]; then
   esac
 fi
 case "$VARIANT" in
-  gpu|cpu) ;;
-  # Back-compat: an old caller may still pass 'nvidia' — treat it as the gpu build.
-  nvidia) VARIANT="gpu" ;;
-  *) echo "[X] Unknown build '$VARIANT'. Use one of: gpu | cpu" >&2; exit 1 ;;
+  gpu|gpu-cuda|cpu) ;;
+  # Convenience: 'cuda' => the CUDA build; 'nvidia' (old callers) => CUDA too now.
+  cuda|nvidia) VARIANT="gpu-cuda" ;;
+  *) echo "[X] Unknown build '$VARIANT'. Use one of: gpu-cuda | gpu | cpu" >&2; exit 1 ;;
 esac
 
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/midstate-miner"
@@ -112,14 +112,21 @@ case "$(uname -s 2>/dev/null)" in
   Darwin) PLATFORM="macos" ;;
   *)      PLATFORM="linux" ;;
 esac
-# Asset basename. cpu => midstate-miner-<platform>; gpu => midstate-miner-<platform>-gpu
-# (the OpenCL/hybrid build, published per-OS). The name here MUST equal the
-# release asset + its SHA256SUMS key (see release.yml ASSET-NAME CONTRACT).
-if [ "$VARIANT" = "cpu" ]; then
-  BIN_NAME="midstate-miner-$PLATFORM"
-else
-  BIN_NAME="midstate-miner-$PLATFORM-gpu"
+# The CUDA asset (…-gpu-cuda) is built for Linux ONLY (release.yml). On macOS
+# downgrade gpu-cuda to the cross-platform gpu (wgpu) build before mapping names.
+if [ "$VARIANT" = "gpu-cuda" ] && [ "$PLATFORM" != "linux" ]; then
+  echo "[!] CUDA build is Linux-only; using the gpu (wgpu) build on $PLATFORM."
+  VARIANT="gpu"
 fi
+# Asset basename. cpu => midstate-miner-<platform>; gpu => midstate-miner-<platform>-gpu
+# (the OpenCL/wgpu/hybrid build); gpu-cuda => midstate-miner-<platform>-gpu-cuda
+# (the native CUDA build, Linux). The name MUST equal the release asset + its
+# SHA256SUMS key (see release.yml ASSET-NAME CONTRACT).
+case "$VARIANT" in
+  cpu)      BIN_NAME="midstate-miner-$PLATFORM" ;;
+  gpu)      BIN_NAME="midstate-miner-$PLATFORM-gpu" ;;
+  gpu-cuda) BIN_NAME="midstate-miner-$PLATFORM-gpu-cuda" ;;
+esac
 BIN="$DATA_DIR/$BIN_NAME"
 CHECK_MIN="${CHECK_MIN:-15}"
 LIVE_SEC="${LIVE_SEC:-30}"
@@ -217,18 +224,31 @@ expected_sha() {
 download_verify_swap() {
   local staged="$BIN.new" want
   if ! download "https://github.com/$REPO/releases/latest/download/$BIN_NAME" "$staged"; then
-    if [ "$VARIANT" != "cpu" ]; then
-      echo "[!] '$VARIANT' build unavailable (download failed / 404). Falling back to the cpu build." >&2
-      VARIANT="cpu"
-      BIN_NAME="midstate-miner-$PLATFORM"
+    # gpu-cuda missing → try the plain gpu (OpenCL/wgpu) asset before dropping to
+    # cpu, so an NVIDIA rig keeps a GPU build (slower path) rather than cpu-only.
+    if [ "$VARIANT" = "gpu-cuda" ]; then
+      echo "[!] 'gpu-cuda' build unavailable. Falling back to the gpu (OpenCL/wgpu) build." >&2
+      VARIANT="gpu"
+      BIN_NAME="midstate-miner-$PLATFORM-gpu"
       BIN="$DATA_DIR/$BIN_NAME"
       staged="$BIN.new"
-      # The CPU binary rejects --mode gpu/hybrid; downgrade an explicit GPU mode to
-      # auto so the fallback rig mines on CPU instead of erroring out on every start.
-      case "$MODE" in gpu|hybrid) MODE="auto" ;; esac
-      download "https://github.com/$REPO/releases/latest/download/$BIN_NAME" "$staged" || return 1
-    else
-      return 1
+      MULTI_GPU=0  # per-card fan-out is a CUDA-only path; the gpu build is single-process
+    fi
+    if ! download "https://github.com/$REPO/releases/latest/download/$BIN_NAME" "$staged"; then
+      if [ "$VARIANT" != "cpu" ]; then
+        echo "[!] '$VARIANT' build unavailable (download failed / 404). Falling back to the cpu build." >&2
+        VARIANT="cpu"
+        BIN_NAME="midstate-miner-$PLATFORM"
+        BIN="$DATA_DIR/$BIN_NAME"
+        staged="$BIN.new"
+        MULTI_GPU=0
+        # The CPU binary rejects --mode gpu/hybrid; downgrade an explicit GPU mode to
+        # auto so the fallback rig mines on CPU instead of erroring out on every start.
+        case "$MODE" in gpu|hybrid) MODE="auto" ;; esac
+        download "https://github.com/$REPO/releases/latest/download/$BIN_NAME" "$staged" || return 1
+      else
+        return 1
+      fi
     fi
   fi
 
@@ -410,6 +430,35 @@ echo
 
 PIDS=()
 
+# How many physical NVIDIA GPUs does this rig have? Used to decide whether to
+# fan out one miner process PER GPU (the high-throughput default on a multi-GPU
+# NVIDIA box) or run the single in-process path. Counts `nvidia-smi -L` lines;
+# 0 when there is no NVIDIA driver / not an NVIDIA rig. Best-effort — any failure
+# yields 0, which falls back to the (unchanged) single-process launch.
+nvidia_gpu_count() {
+  local n=0
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    n="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
+  fi
+  [ "${n:-0}" -ge 0 ] 2>/dev/null || n=0
+  printf '%s' "${n:-0}"
+}
+
+# Spawn one miner process PER NVIDIA GPU only when it actually pays off: the
+# build can use CUDA (the cuda asset) AND we are running a GPU/hybrid/auto mode
+# AND there is more than one card. A single-GPU rig, a forced cpu mode, or a
+# non-cuda build keeps the original single-process path untouched.
+MULTI_GPU=0
+NGPU=1
+if [ "$VARIANT" = "gpu-cuda" ] && [ "$MODE" != "cpu" ]; then
+  NGPU="$(nvidia_gpu_count)"
+  [ "${NGPU:-1}" -gt 1 ] 2>/dev/null && MULTI_GPU=1
+fi
+if [ "$MULTI_GPU" -eq 1 ]; then
+  echo "Detected $NGPU NVIDIA GPUs -> spawning one worker per GPU (rig-g0..rig-g$(( NGPU - 1 )), CUDA_VISIBLE_DEVICES pinning). g0 = hybrid (CPU+GPU), rest gpu-only."
+  echo
+fi
+
 stop_miners() {
   if [ "${#PIDS[@]}" -gt 0 ]; then
     kill "${PIDS[@]}" 2>/dev/null || true
@@ -420,20 +469,47 @@ stop_miners() {
   PIDS=()
 }
 
-# Start ONE miner process. The binary handles all hardware itself: --mode picks
-# cpu / gpu / hybrid / auto, and the OpenCL backend drives every GPU device +
-# the hybrid backend runs CPU + GPU concurrently in-process. So there is exactly
-# one process per rig (no per-card fan-out, no --device/--gpu-id/--log-dir — the
-# v0.1.1 binary does not take those). If a GPU build is asked to run a GPU/hybrid
-# mode but finds no usable device at runtime it degrades or errors clearly; auto
-# always falls back to CPU. We log to a per-build file under $DATA_DIR.
+# Start the miner(s).
+#
+# SINGLE-PROCESS (default for 0/1 GPU, cpu mode, or a non-cuda build): one
+# process per rig. The binary handles all hardware itself — --mode picks
+# cpu / gpu / hybrid / auto, and the GPU backend drives the device while the
+# hybrid backend runs CPU + GPU concurrently in-process. We log to a per-build
+# file under $DATA_DIR.
+#
+# MULTI-GPU (CUDA build + GPU/hybrid/auto mode + >1 NVIDIA card): fan out ONE
+# process per physical GPU, each pinned to a single card via CUDA_VISIBLE_DEVICES
+# (so every worker sees exactly one device at index 0 and the CUDA backend can
+# never collide on a card). This is the fix for a multi-4090 rig getting a
+# fraction of a native miner's rate: the embarrassingly-parallel nonce search now
+# runs N independent saturating processes instead of one process time-slicing the
+# cards. The FIRST worker (g0) runs --mode hybrid so spare CPU cores aren't idle;
+# the rest run --mode gpu. Each worker gets its own log (rig-g<i>.log). The
+# fail-safe invariant is unchanged: each process still boot-self-tests GPU vs CPU
+# midstate_pow and CPU-re-verifies every candidate before it becomes a share.
 start_miners() {
   PIDS=()
   local logdir="$DATA_DIR/${VARIANT}-log"
   mkdir -p "$logdir"
-  "$BIN" --address "$ADDR" --mode "$MODE" \
-    > "$logdir/stdout.log" 2>&1 &
-  PIDS+=("$!")
+
+  if [ "$MULTI_GPU" -ne 1 ]; then
+    "$BIN" --address "$ADDR" --mode "$MODE" \
+      > "$logdir/stdout.log" 2>&1 &
+    PIDS+=("$!")
+    return
+  fi
+
+  # One worker per GPU. CUDA_VISIBLE_DEVICES=i masks all but card i, so --gpu-id 0
+  # (or omitted) targets exactly that card. Worker g0 = hybrid (CPU+GPU), rest gpu.
+  local i wmode
+  for i in $(seq 0 $(( NGPU - 1 ))); do
+    if [ "$i" -eq 0 ]; then wmode="hybrid"; else wmode="gpu"; fi
+    # hybrid only makes sense if the operator didn't force a plain gpu run.
+    [ "$MODE" = "gpu" ] && wmode="gpu"
+    CUDA_VISIBLE_DEVICES="$i" "$BIN" --address "$ADDR" --mode "$wmode" --gpu-id 0 \
+      > "$logdir/rig-g$i.log" 2>&1 &
+    PIDS+=("$!")
+  done
 }
 
 # Are any of our launched miners still alive?

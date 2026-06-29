@@ -32,8 +32,9 @@ name: release
 # basename, and FAIL CLOSED if either the asset or its checksum line is absent.
 # So these names are NOT free to change without changing the launchers too:
 #
-#   midstate-miner.exe        Windows CPU  (mine-auto.bat / install-*.bat: EXE=midstate-miner.exe)
-#   midstate-miner-gpu.exe    Windows GPU  (mine-auto.bat / install-*.bat: EXE=midstate-miner-gpu.exe)
+#   midstate-miner.exe          Windows CPU       (mine-auto.bat / install-*.bat: EXE=midstate-miner.exe)
+#   midstate-miner-gpu.exe      Windows GPU OpenCL (mine-auto.bat / install-*.bat: EXE=midstate-miner-gpu.exe)
+#   midstate-miner-gpu-cuda.exe Windows GPU CUDA   (mine-auto.bat / install-*.bat: EXE=midstate-miner-gpu-cuda.exe, NVIDIA-preferred)
 #   midstate-miner-linux      Linux   CPU  (mine-auto.sh  / install-*.sh:  BIN_NAME=midstate-miner-linux)
 #   midstate-miner-linux-gpu  Linux   GPU  (mine-auto.sh  / install-*.sh:  BIN_NAME=midstate-miner-linux-gpu)
 #   midstate-miner-macos      macOS   CPU  (mine-auto.sh on Darwin: BIN_NAME=midstate-miner-macos)
@@ -123,6 +124,22 @@ jobs:
         run: |
           cargo build --release --features opencl
           Copy-Item target/release/midstate-miner.exe dist/midstate-miner-gpu.exe
+
+      # GPU build for NVIDIA CUDA on Windows (the fastest path on an NVIDIA rig).
+      # CONFIRMED working: builds NATIVELY via cudarc DYNAMIC-LOADING + the committed,
+      # version-pinned PTX (src/cuda/midstate.ptx) — so the runner needs NO CUDA
+      # toolkit (only the crate); the rig's driver (nvcuda.dll) JIT-compiles the PTX
+      # at run time. Validated on an RTX 5070 Ti (golden vectors pass, GPU pegged,
+      # accepted shares). Kernel is bit-exact vs the CPU PoW + boot self_test
+      # fail-closes + every nonce is CPU-re-verified, so a bad GPU can't submit an
+      # invalid share. Uploaded as `midstate-miner-gpu-cuda.exe`, the EXACT name the
+      # Windows launchers fetch + key SHA256SUMS on for an NVIDIA host (with a
+      # fail-closed fallback to midstate-miner-gpu.exe / the CPU build).
+      - name: Build GPU (cuda)
+        shell: pwsh
+        run: |
+          cargo build --release --features cuda
+          Copy-Item target/release/midstate-miner.exe dist/midstate-miner-gpu-cuda.exe
 
       - name: List built artifacts
         shell: pwsh
@@ -300,7 +317,8 @@ jobs:
           # digests file can never (self-)reference a partially-written copy of
           # itself regardless of glob/redirect ordering. The filename field here
           # is the EXACT basename the launchers look up (midstate-miner.exe,
-          # midstate-miner-gpu.exe, midstate-miner-linux, midstate-miner-linux-gpu,
+          # midstate-miner-gpu.exe, midstate-miner-gpu-cuda.exe, midstate-miner-linux,
+          # midstate-miner-linux-gpu, midstate-miner-linux-gpu-cuda,
           # midstate-miner-macos, midstate-miner-macos-gpu, mine-auto.sh, ...),
           # which is what makes upload == download == SHA256SUMS key.
           find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort > .asset-list

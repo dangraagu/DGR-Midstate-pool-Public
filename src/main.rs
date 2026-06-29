@@ -48,6 +48,12 @@ struct Cli {
     /// exit. Use the printed index with `--gpu-id`. Requires a `wgpu` build.
     #[arg(long, default_value_t = false)]
     list_gpus: bool,
+    /// CUDA only: nonces per `search` window (the GPU "batch"). `search` pipelines
+    /// this window across streams to keep the card pegged. Bigger = the GPU stays
+    /// busier but the job-epoch is re-checked less often; the default (262144) fills
+    /// a 4090-class card. Omit to auto-size. No effect on non-CUDA backends.
+    #[arg(long)]
+    gpu_batch: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -79,7 +85,14 @@ fn main() -> Result<()> {
     println!(
         "midstate-miner | endpoint={endpoint} | logical_cores={logical} physical_cores={physical}"
     );
-    let mut backend = select_backend(requested, physical, logical, cli.cpu_threads, cli.gpu_id)?;
+    let mut backend = select_backend(
+        requested,
+        physical,
+        logical,
+        cli.cpu_threads,
+        cli.gpu_id,
+        cli.gpu_batch,
+    )?;
 
     let cfg = ClientConfig {
         host,
@@ -154,14 +167,17 @@ fn list_gpus() -> Result<()> {
 /// checkpointed dispatch — no TDR), then `opencl`. Each is fail-closed: on an
 /// EXPLICIT `--gpu-id` an error propagates (exits 1); on auto a `None` falls
 /// through to the next backend / CPU.
-fn try_gpu_backend(gpu_id: Option<usize>) -> Result<Option<Box<dyn Backend>>> {
+fn try_gpu_backend(gpu_id: Option<usize>, gpu_batch: Option<u32>) -> Result<Option<Box<dyn Backend>>> {
     // `gpu_id` is consumed only by the cuda/wgpu arms; in a CPU-only / opencl-only
     // build it is unused — acknowledge it so there's no unused-variable warning.
     #[cfg(not(any(feature = "cuda", feature = "wgpu")))]
     let _ = gpu_id;
+    // `gpu_batch` is consumed only by the cuda arm; ack it in non-cuda builds.
+    #[cfg(not(feature = "cuda"))]
+    let _ = gpu_batch;
     #[cfg(feature = "cuda")]
     {
-        match midstate_miner::cuda_backend::CudaBackend::try_new(gpu_id) {
+        match midstate_miner::cuda_backend::CudaBackend::try_new(gpu_id, gpu_batch) {
             Ok(Some(b)) => return Ok(Some(Box::new(b))),
             Ok(None) => {} // no usable CUDA device — try wgpu (if built) / opencl / CPU
             Err(e) => {
@@ -224,6 +240,7 @@ fn select_backend(
     logical: usize,
     cpu_threads: Option<usize>,
     gpu_id: Option<usize>,
+    gpu_batch: Option<u32>,
 ) -> Result<Box<dyn Backend>> {
     // --- AUTO-DISCOVER ------------------------------------------------------
     // Probe for a GPU only when the request could USE one (cpu mode never probes,
@@ -231,7 +248,7 @@ fn select_backend(
     // the device once and reuse it for hybrid/gpu so we don't init twice.
     let mut gpu_backend: Option<Box<dyn Backend>> = None;
     if matches!(requested, Mode::Gpu | Mode::Hybrid | Mode::Auto) {
-        gpu_backend = try_gpu_backend(gpu_id)?;
+        gpu_backend = try_gpu_backend(gpu_id, gpu_batch)?;
     }
     let gpu_present = gpu_backend.is_some();
     let gpu_label = gpu_backend.as_deref().map(|b| b.name().to_string());

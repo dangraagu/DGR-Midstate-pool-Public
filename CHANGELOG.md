@@ -4,6 +4,29 @@ All notable changes to **midstate-pool-miner** are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-06-29
+
+### Added
+
+- **Windows CUDA build** (`midstate-miner-gpu-cuda.exe`) so Windows NVIDIA rigs
+  use the native CUDA backend instead of the slower OpenCL/wgpu fallback. The
+  launchers detect an NVIDIA card and default to CUDA on Windows the same way they
+  already do on Linux.
+- **CUDA-default-on-NVIDIA + one-process-per-GPU auto-spawn** in
+  `mine-auto.sh`/`mine-auto.bat` — on a multi-GPU NVIDIA box the launcher spawns
+  one CUDA process per GPU (`--gpu-id`) automatically.
+
+### Changed
+
+- **2-stream pipeline plumbing refactor** in the CUDA backend — the search loop now
+  carries its sub-waves across two CUDA streams with ping-pong count/result buffers
+  so host readback + CPU re-verify of one wave overlaps the next wave's kernel,
+  freeing a host core. This is a **non-regression** pipeline change, **not** a
+  hashrate increase: the existing CUDA kernel was already GPU-bound, so per-GPU
+  hashrate is unchanged. **No consensus / PoW / kernel change** — the committed
+  `midstate.cu` / `midstate.ptx` are byte-identical and the boot self-test still
+  byte-compares against the CPU reference, fail-closed.
+
 ## [0.1.5] - 2026-06-26
 
 ### Added
@@ -115,6 +138,8 @@ launcher.
   been validated against the golden vectors on POCL; if you hit a GPU-specific
   reject pattern, fall back to `--mode cpu` and report it.
 
+[0.1.6]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.6
+[0.1.5]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.5
 [0.1.4]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.4
 [0.1.3]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.3
 [0.1.2]: https://github.com/dangraagu/DGR-Midstate-pool-Public/releases/tag/v0.1.2

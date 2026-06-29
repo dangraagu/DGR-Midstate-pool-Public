@@ -77,7 +77,7 @@ fn reverify_empty_is_empty() {
 #[ignore = "needs an NVIDIA CUDA device + the cuda feature; run with --release --ignored"]
 fn cuda_search_reproduces_golden_vectors() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut b = CudaBackend::try_new(Some(0))
+    let mut b = CudaBackend::try_new(Some(0), None)
         .expect("cuda try_new")
         .expect("a CUDA device");
     let target = [0xffu8; 32]; // every nonce clears it
@@ -95,7 +95,7 @@ fn cuda_search_reproduces_golden_vectors() {
 #[ignore = "needs an NVIDIA CUDA device + the cuda feature; run with --release --ignored"]
 fn cuda_search_rejects_non_winners() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut b = CudaBackend::try_new(Some(0))
+    let mut b = CudaBackend::try_new(Some(0), None)
         .expect("cuda try_new")
         .expect("a CUDA device");
     let target = [0x00u8; 32]; // nothing is < 0
@@ -111,7 +111,7 @@ fn cuda_search_rejects_non_winners() {
 #[ignore = "needs an NVIDIA CUDA device + the cuda feature; run with --release --ignored"]
 fn cuda_window_surfaces_exactly_cpu_winners() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut b = CudaBackend::try_new(Some(0))
+    let mut b = CudaBackend::try_new(Some(0), None)
         .expect("cuda try_new")
         .expect("a CUDA device");
     let mid = [0u8; 32];
