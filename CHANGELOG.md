@@ -4,6 +4,21 @@ All notable changes to **midstate-pool-miner** are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-06-29
+
+### Fixed
+
+- **mine-auto.bat fork bomb (P0).** The Windows launcher's liveness check used
+  `tasklist`'s default TABLE format, which truncates the Image Name column to 25
+  chars — so the 27-char `midstate-miner-gpu-cuda.exe` (the NVIDIA/CUDA default)
+  displayed as `midstate-miner-gpu-cuda.e` and `find` for the full name never
+  matched. The launcher concluded the miner was dead every tick and spawned
+  another, accumulating processes without bound. Fixed by using `/FO CSV` (full,
+  un-truncated name) for the liveness check, plus an idempotent `taskkill /IM
+  %EXE%` before each spawn so a misfiring check can never accumulate processes.
+  Only the CUDA variant (27-char name) was affected; CPU/OpenCL names fit. The
+  Linux/HiveOS `mine-auto.sh` tracks PIDs directly and was never affected.
+
 ## [0.1.7] - 2026-06-29
 
 ### Added

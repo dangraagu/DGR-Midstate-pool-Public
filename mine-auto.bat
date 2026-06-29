@@ -251,7 +251,12 @@ call :update_check
 :loop
 REM --- fast path: keep the miners alive with escalating backoff ---
 if not "!INSTALLED!"=="none" (
-  tasklist /FI "IMAGENAME eq %EXE%" 2>nul | find /I "%EXE%" >nul
+  REM /FO CSV is REQUIRED: tasklist's default TABLE format truncates the Image Name
+  REM column to 25 chars, so the 27-char "midstate-miner-gpu-cuda.exe" displayed as
+  REM "midstate-miner-gpu-cuda.e" and `find` for the full name NEVER matched -> the
+  REM loop thought the miner was dead every tick -> respawned forever (fork bomb).
+  REM CSV keeps the full quoted name. (fix v0.1.8)
+  tasklist /NH /FO CSV /FI "IMAGENAME eq %EXE%" 2>nul | find /I "%EXE%" >nul
   if errorlevel 1 (
     REM No miner process is running.
     if !RESTARTS! GEQ %MAX_RESTARTS% (
@@ -573,6 +578,11 @@ REM ONE process per rig. The binary handles all hardware via --mode (cpu/gpu/
 REM hybrid/auto): the OpenCL backend drives every GPU device and the hybrid
 REM backend runs CPU+GPU concurrently in-process. No --device/--gpu-id/--log-dir
 REM (the v0.1.1 binary does not accept those).
+REM BELT (defense-in-depth vs fork bombs): kill any existing miner of this name
+REM before spawning, so even a misfiring liveness check can never ACCUMULATE
+REM processes. Idempotent - a genuine restart kills nothing; a false "dead" kills
+REM the still-live one and respawns exactly one.
+taskkill /IM "%EXE%" /F >nul 2>&1
 start "Midstate miner (!INSTALLED!, %MODE%/%VARIANT%)" "%BIN%" --address !ADDR! --mode %MODE%
 goto :eof
 

@@ -1,6 +1,6 @@
 [package]
 name = "midstate-pool-miner"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license-file = "LICENSE"
 description = "Open-source pool miner for Midstate (post-quantum, BLAKE3 sequential-VDF PoW). Pool-only, endpoint-locked."
