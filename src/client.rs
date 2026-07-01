@@ -7,7 +7,7 @@
 //! A read timeout doubles as the half-open/stalled-job watchdog.
 
 use crate::backend::Backend;
-use crate::stratum::{classify, Event, Incoming, RpcRequest, Job, ID_AUTHORIZE, ID_SUBMIT};
+use crate::stratum::{classify, Event, Incoming, RpcRequest, Job, ID_AUTHORIZE, ID_KEEPALIVE, ID_SUBMIT};
 use crate::target::share_target;
 use anyhow::{anyhow, Context, Result};
 use std::hash::{BuildHasher, Hasher};
@@ -74,6 +74,11 @@ struct Shared {
     // v0.1.9 — nonces ground this session (each search window adds its batch).
     // Feeds the heartbeat `hs=` field so "up but not hashing" is visible.
     hashes: AtomicU64,
+    // v0.1.9 — found shares DISCARDED because the job rolled before they could
+    // be submitted (whole-window drop + mid-submit break). This is the measurable
+    // for the stale-window leak: on a slow card the window outlives the ~60s job
+    // cadence and most found shares die here, invisible in submit/reject counts.
+    stale_dropped: AtomicU64,
 }
 
 /// Supervisor: run forever (or until `duration`), reconnecting on any error.
@@ -125,6 +130,11 @@ fn session(
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let stream = TcpStream::connect(&addr).with_context(|| format!("connect {addr}"))?;
     stream.set_read_timeout(Some(cfg.read_timeout))?;
+    // v0.1.9 — disable Nagle: submits are tiny single-line writes; coalescing
+    // them behind an ACK adds RTT-scale latency exactly when a share (or a
+    // block-winning share) should be on the wire immediately. The pool side
+    // already sets nodelay.
+    stream.set_nodelay(true)?;
     let mut writer = stream.try_clone()?;
     println!("[miner] connected to {addr}");
 
@@ -136,6 +146,7 @@ fn session(
         accepted: AtomicU64::new(0),
         rejected: AtomicU64::new(0),
         hashes: AtomicU64::new(0),
+        stale_dropped: AtomicU64::new(0),
     });
     // v0.1.9 — session-relative clock for the FINAL session-average hashrate
     // (`start` is the process-lifetime clock and spans reconnects).
@@ -231,6 +242,7 @@ fn session(
     let mut cursor: u64 = nonce_base;
     let mut last_hb = Instant::now();
     let mut last_hb_hashes: u64 = 0; // v0.1.9 — hashes total at the last heartbeat
+    let mut last_ka = Instant::now(); // v0.1.9 — last keepalive sent
     let res = (|| -> Result<()> {
         loop {
             if shared.stop.load(Ordering::Relaxed) {
@@ -240,6 +252,26 @@ fn session(
                 if start.elapsed() >= d {
                     return Ok(());
                 }
+            }
+
+            // v0.1.9 — KEEPALIVE: the pool closes any connection with no inbound
+            // line for 120s (its idle read-timeout). Slow submitters — a CPU rig
+            // (~1 share / 4+ min), the never-dark reduced fallback, or a miner
+            // parked in the no-job wait below while the pool gates jobs during a
+            // node re-sync — would flap connect/drop forever. mining.subscribe is
+            // a no-op ack on the pool; one line every 30s keeps the timer fresh.
+            // Sits ABOVE the job check so the no-job wait is covered too. (A
+            // single search window longer than 120s can still outlive the timer
+            // mid-window — bounded by the default batch sizes; fully fixed by the
+            // streamed-search work planned for v0.1.10.)
+            if last_ka.elapsed() >= Duration::from_secs(30) {
+                last_ka = Instant::now();
+                send(
+                    &mut writer,
+                    ID_KEEPALIVE,
+                    "mining.subscribe",
+                    serde_json::json!([]),
+                )?;
             }
 
             // Snapshot the CURRENT job + epoch BEFORE searching. The shares we find
@@ -275,11 +307,23 @@ fn session(
             // (mismatched job_id). We drop the whole batch and grind the fresh job.
             let rolled_mid_window = shared.epoch.load(Ordering::Acquire) != epoch;
             if rolled_mid_window {
+                // v0.1.9 — count the whole window's finds as stale-dropped so the
+                // leak is measurable per rig (hb/FINAL print it).
+                if !found.is_empty() {
+                    shared
+                        .stale_dropped
+                        .fetch_add(found.len() as u64, Ordering::Relaxed);
+                }
                 continue; // fresh job is already published; loop picks it up next pass
             }
-            for f in found {
+            let total_found = found.len();
+            for (i, f) in found.into_iter().enumerate() {
                 // Re-check per share: the job can roll between submits in a window.
                 if shared.epoch.load(Ordering::Acquire) != epoch {
+                    // v0.1.9 — the not-yet-submitted remainder dies stale too.
+                    shared
+                        .stale_dropped
+                        .fetch_add((total_found - i) as u64, Ordering::Relaxed);
                     break; // job rolled; never submit a stale share / mismatched job_id
                 }
                 send(
@@ -304,12 +348,13 @@ fn session(
                 last_hb_hashes = total;
                 last_hb = Instant::now();
                 println!(
-                    "[miner] hb: backend={} hs={} submitted={} accepted={} rejected={}",
+                    "[miner] hb: backend={} hs={} submitted={} accepted={} rejected={} stale_dropped={}",
                     backend.name(),
                     hs,
                     shared.submitted.load(Ordering::Relaxed),
                     shared.accepted.load(Ordering::Relaxed),
-                    shared.rejected.load(Ordering::Relaxed)
+                    shared.rejected.load(Ordering::Relaxed),
+                    shared.stale_dropped.load(Ordering::Relaxed)
                 );
             }
         }
@@ -319,14 +364,15 @@ fn session(
     let _ = writer.shutdown(std::net::Shutdown::Both); // unblock the reader
     let _ = reader_handle.join();
     println!(
-        "[miner] FINAL: hs_avg={} submitted={} accepted={} rejected={}",
+        "[miner] FINAL: hs_avg={} submitted={} accepted={} rejected={} stale_dropped={}",
         windowed_rate(
             shared.hashes.load(Ordering::Relaxed),
             session_start.elapsed().as_secs_f64(),
         ),
         shared.submitted.load(Ordering::Relaxed),
         shared.accepted.load(Ordering::Relaxed),
-        shared.rejected.load(Ordering::Relaxed)
+        shared.rejected.load(Ordering::Relaxed),
+        shared.stale_dropped.load(Ordering::Relaxed)
     );
     res
 }

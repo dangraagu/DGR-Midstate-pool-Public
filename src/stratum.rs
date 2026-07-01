@@ -54,6 +54,10 @@ pub enum Event {
 /// Conventional request ids (the pool echoes whatever id we send).
 pub const ID_AUTHORIZE: u64 = 1;
 pub const ID_SUBMIT: u64 = 2;
+/// v0.1.9 — keepalive `mining.subscribe` (the pool acks `result:true` and, more
+/// importantly, resets its 120s idle read-timeout). The ack must classify as
+/// [`Event::Other`], never as an auth/submit ack.
+pub const ID_KEEPALIVE: u64 = 3;
 
 fn parse_midstate(hex_str: &str) -> Option<[u8; 32]> {
     let bytes = hex::decode(hex_str).ok()?;
@@ -156,6 +160,21 @@ mod tests {
                 error: Some("Low difficulty".to_string())
             }
         );
+    }
+
+    /// v0.1.9 — the keepalive ack (id=3, result:true — exactly what the pool
+    /// sends back for mining.subscribe) must classify as Other: it must never be
+    /// mistaken for an AuthAck (could flip authorized state) or a SubmitAck
+    /// (would inflate accepted counts).
+    #[test]
+    fn keepalive_ack_is_other() {
+        assert_eq!(
+            classify(parse(r#"{"id":3,"result":true,"error":null}"#)),
+            Event::Other
+        );
+        assert_eq!(ID_KEEPALIVE, 3);
+        assert_ne!(ID_KEEPALIVE, ID_AUTHORIZE);
+        assert_ne!(ID_KEEPALIVE, ID_SUBMIT);
     }
 
     #[test]
