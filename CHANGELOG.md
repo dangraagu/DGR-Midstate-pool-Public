@@ -31,13 +31,46 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   integer ops. Validated bit-exact on real hardware (RTX 5070 Ti, 5/5 golden
   vectors, two runs).
 
+- **Never-dark details (adversarial-review hardening).** (a) Fallback runs are
+  TIME-CAPPED at 30 minutes: the process exits cleanly, the launcher restarts
+  it within seconds, and the GPU is re-probed — so a *transient* GPU failure at
+  boot cannot latch a rig into the CPU trickle forever (a permanent failure just
+  cycles visible-fallback → re-probe). A shorter user `--duration` still wins.
+  (b) An explicit `--gpu-id` under the default `--mode auto` is treated as
+  GPU-intent: if the pinned GPU fails, the rig gets the *reduced* fallback (or
+  an error under `--strict-gpu`), never a full-width all-cores CPU miner — one
+  process per card on a broken multi-GPU rig stays a bounded trickle. Healthy
+  pinned rigs are bit-identical to v0.1.8. (c) `--cpu-threads 0` is floored to
+  1 inside the fallback (a 0-thread fallback would exit before connecting —
+  the invisible crash-loop again); `--strict-gpu` is the supported way to
+  forbid fallback CPU mining entirely. Note: an explicit `--cpu-threads N`
+  (e.g. `mine-multi-gpu.sh` worker g0) still overrides the trickle by design.
+
 ### Added
 
 - **Heartbeat hashrate.** The 30-second `[miner] hb:` line now reports
   `backend=<name> hs=<H/s>` (windowed rate since the previous heartbeat), and
-  the session `FINAL:` line reports `hs_avg=`. A rig that is up-but-not-hashing
-  prints `hs=0` every 30 s in its own launcher log, so a degraded rig is loud
-  locally instead of only visible by inspecting pool-side hashrate.
+  the session `FINAL:` line reports `hs_avg=`. While a job is being mined, a
+  degraded rig shows `hs=0` (or a CPU-fallback `backend=`) right in its own
+  launcher log; a rig with no job prints no heartbeat at all — heartbeat
+  *absence* is the waiting/hung signal.
+- **Keepalive — no more idle-disconnect flapping.** The miner now sends a
+  `mining.subscribe` keepalive every 30 s (the pool acks it and, crucially, its
+  120 s idle read-timeout is reset). Slow submitters — CPU rigs (a share every
+  4+ minutes), the never-dark reduced fallback, or a miner waiting while the
+  pool gates jobs during a node re-sync — previously flapped
+  connect→120s→drop→reconnect forever. Proven live: a 150 s zero-submit run
+  held one unbroken connection. (A single GPU search window longer than 120 s
+  can still outlive the timer mid-window; fully addressed by the streamed
+  search planned for v0.1.10.)
+- **`stale_dropped=` counter** in the heartbeat and `FINAL:` lines: found
+  shares discarded because the job rolled before they could be submitted
+  (whole-window drops + mid-submit remainders). This makes the stale-window
+  share leak measurable per rig — the prerequisite for validating the v0.1.10
+  streamed-search fix and interim `--gpu-batch` tuning on slow cards.
+- **`TCP_NODELAY` on the miner socket** (best-effort): submits are tiny
+  one-line writes; Nagle coalescing added RTT-scale latency exactly when a
+  share — or a block-winning share — should be on the wire immediately.
 
 ## [0.1.8] - 2026-06-29
 

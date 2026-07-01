@@ -136,6 +136,34 @@ pub fn select_mode(requested: Mode, gpu_built: bool, gpu_present: bool, strict: 
     }
 }
 
+/// v0.1.9 review fix #2 — post-adjust for an explicit `--gpu-id` under default
+/// `--mode auto`. PURE.
+///
+/// The `--gpu-id` help text promises "mine the card you asked for, or learn why
+/// you can't". But plain `auto` resolves a failed/absent GPU to FULL-WIDTH
+/// [`Resolved::Cpu`] (all logical cores) — on a broken multi-GPU rig running one
+/// process per card that is N full-width CPU miners, not the reduced never-dark
+/// trickle. This adjusts exactly that one cell:
+/// - `pinned` (an explicit `--gpu-id` was given) AND the resolution landed on
+///   plain `Cpu` (i.e. the pinned GPU did not survive) → the reduced
+///   [`Resolved::CpuFallback`] (default) or [`Resolved::Error`] (strict).
+/// - Everything else (not pinned, GPU healthy, already a fallback/error) is
+///   returned untouched — the healthy pinned path stays bit-identical.
+pub fn adjust_auto_pinned(resolved: Resolved, pinned: bool, strict: bool) -> Resolved {
+    const PINNED_REASON: &str = "explicit --gpu-id: the pinned GPU could not initialize \
+         (see the failure above)";
+    match resolved {
+        Resolved::Cpu if pinned => {
+            if strict {
+                Resolved::Error(PINNED_REASON)
+            } else {
+                Resolved::CpuFallback(PINNED_REASON)
+            }
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +278,51 @@ mod tests {
             Resolved::Error(m) => assert!(m.contains("GPU build")),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    // ---- v0.1.9 review fix #2: explicit --gpu-id under default `auto` --------
+    /// A user who PINNED a GPU (`--gpu-id N`) but left `--mode auto` promised the
+    /// help text "mine the card you asked for or learn why you can't". When that
+    /// pinned GPU fails, plain auto would resolve to FULL-WIDTH Cpu (all logical
+    /// cores × one process per card = a resource blowup on a broken multi-GPU
+    /// rig). `adjust_auto_pinned` demotes that outcome to the reduced
+    /// CpuFallback (default) or Error (strict) — and touches NOTHING else.
+    #[test]
+    fn auto_pinned_gpu_failure_is_reduced_fallback_not_full_cpu() {
+        // auto + pinned + GPU failed (resolved Cpu) → reduced fallback.
+        match adjust_auto_pinned(Resolved::Cpu, true, false) {
+            Resolved::CpuFallback(m) => assert!(m.contains("--gpu-id")),
+            other => panic!("expected CpuFallback, got {other:?}"),
+        }
+        // strict: same situation → Error.
+        match adjust_auto_pinned(Resolved::Cpu, true, true) {
+            Resolved::Error(m) => assert!(m.contains("--gpu-id")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adjust_auto_pinned_touches_nothing_else() {
+        // Not pinned → identity, for every variant.
+        for r in [
+            Resolved::Cpu,
+            Resolved::Gpu,
+            Resolved::Hybrid,
+            Resolved::CpuFallback("x"),
+            Resolved::Error("y"),
+        ] {
+            assert_eq!(adjust_auto_pinned(r, false, false), r);
+            assert_eq!(adjust_auto_pinned(r, false, true), r);
+        }
+        // Pinned but the GPU WORKED (Hybrid via auto) → identity.
+        assert_eq!(adjust_auto_pinned(Resolved::Hybrid, true, false), Resolved::Hybrid);
+        assert_eq!(adjust_auto_pinned(Resolved::Gpu, true, true), Resolved::Gpu);
+        // Pinned + already a fallback/error → identity (no double-wrap).
+        assert_eq!(
+            adjust_auto_pinned(Resolved::CpuFallback("x"), true, false),
+            Resolved::CpuFallback("x")
+        );
+        assert_eq!(adjust_auto_pinned(Resolved::Error("y"), true, true), Resolved::Error("y"));
     }
 
     /// Exhaustive 4(mode)×2(built)×2(present)×2(strict) matrix — every cell

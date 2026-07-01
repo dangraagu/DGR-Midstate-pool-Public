@@ -2,8 +2,8 @@
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
-use midstate_miner::client::{run, ClientConfig};
-use midstate_miner::mode::{select_mode, Mode, Resolved};
+use midstate_miner::client::{capped_duration, run, ClientConfig};
+use midstate_miner::mode::{adjust_auto_pinned, select_mode, Mode, Resolved};
 use midstate_miner::{
     cpu_fallback_thread_budget, cpu_only_thread_budget, cpu_thread_budget, pool_endpoint, Backend,
     CpuBackend, HybridBackend,
@@ -61,10 +61,18 @@ struct Cli {
     /// STRICT GPU: restore the pre-v0.1.9 contract — exit with an error when
     /// `--mode gpu`/`hybrid` or an explicit `--gpu-id` cannot initialize its GPU,
     /// instead of the default loud reduced-thread CPU fallback (never-dark).
-    /// Use on rigs where CPU mining must never happen.
+    /// Only affects failed GPU requests: plain `--mode auto` (without --gpu-id)
+    /// and `--mode cpu` mine on CPU by design regardless of this flag.
     #[arg(long, default_value_t = false)]
     strict_gpu: bool,
 }
+
+/// v0.1.9 review fix #1 — never-dark fallback runs are TIME-CAPPED so a
+/// transient GPU failure cannot latch the rig into the CPU trickle forever:
+/// after this many seconds the process exits cleanly, the launcher restarts it
+/// within seconds (its normal liveness loop), and the GPU is re-probed. A
+/// permanent failure just cycles visible-fallback → re-probe → visible-fallback.
+const FALLBACK_RETRY_SECS: u64 = 1800;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -95,7 +103,7 @@ fn main() -> Result<()> {
     println!(
         "midstate-miner | endpoint={endpoint} | logical_cores={logical} physical_cores={physical}"
     );
-    let mut backend = select_backend(
+    let (mut backend, fell_back) = select_backend(
         requested,
         physical,
         logical,
@@ -113,7 +121,15 @@ fn main() -> Result<()> {
         reconnect_backoff: Duration::from_secs(5),
         read_timeout: Duration::from_secs(120),
     };
-    let dur = (cli.duration != 0).then(|| Duration::from_secs(cli.duration));
+    let mut dur = (cli.duration != 0).then(|| Duration::from_secs(cli.duration));
+    if fell_back {
+        // Review fix #1: cap the fallback run so it cannot latch (see the const).
+        dur = capped_duration(dur, Duration::from_secs(FALLBACK_RETRY_SECS));
+        println!(
+            "never-dark fallback: this process exits after {FALLBACK_RETRY_SECS}s so the \
+             launcher restarts it and RE-PROBES the GPU — transient failures self-heal."
+        );
+    }
     run(cfg, backend.as_mut(), dur)
 }
 
@@ -276,7 +292,9 @@ fn select_backend(
     gpu_id: Option<usize>,
     gpu_batch: Option<u32>,
     strict_gpu: bool,
-) -> Result<Box<dyn Backend>> {
+) -> Result<(Box<dyn Backend>, bool)> {
+    // Returns (backend, fell_back): `fell_back=true` marks the never-dark CPU
+    // fallback so main() can time-cap the run (review fix #1 — no latching).
     // --- AUTO-DISCOVER ------------------------------------------------------
     // Probe for a GPU only when the request could USE one (cpu mode never probes,
     // so a forced-CPU run on a GPU-less box does zero GPU work). We construct
@@ -298,7 +316,16 @@ fn select_backend(
             .unwrap_or_default()
     );
 
-    let resolved = select_mode(requested, GPU_BUILT, gpu_present, strict_gpu);
+    // Review fix #2: an explicit --gpu-id under default `auto` is still
+    // GPU-intent — if the pinned GPU failed, plain auto would resolve to
+    // FULL-WIDTH Cpu (all logical cores × one process per card on a broken
+    // multi-GPU rig). Demote exactly that cell to the reduced fallback
+    // (or Error under --strict-gpu). Healthy pinned paths are untouched.
+    let resolved = adjust_auto_pinned(
+        select_mode(requested, GPU_BUILT, gpu_present, strict_gpu),
+        gpu_id.is_some(),
+        strict_gpu,
+    );
     match resolved {
         Resolved::Error(msg) => bail!("{msg}"),
         Resolved::CpuFallback(reason) => {
@@ -318,6 +345,15 @@ fn select_backend(
                  or --mode cpu for a full-width CPU miner."
             );
             println!("WARNING: {reason} → never-dark CPU fallback (reduced threads)");
+            if cpu_threads == Some(0) {
+                // Review fix: never-dark is absolute — an explicit 0 is floored
+                // to 1 by the budget below (a 0-thread fallback would exit before
+                // connecting = the invisible crash-loop again).
+                eprintln!(
+                    "WARNING: explicit --cpu-threads 0 floored to 1 under the never-dark \
+                     fallback (use --strict-gpu to forbid fallback CPU mining entirely)"
+                );
+            }
             let threads = cpu_fallback_thread_budget(logical, cpu_threads);
             if threads == 0 {
                 bail!("0 CPU threads after fallback budget — nothing to mine");
@@ -330,7 +366,7 @@ fn select_backend(
                 threads,
                 logical
             );
-            Ok(Box::new(b))
+            Ok((Box::new(b), true))
         }
         Resolved::Cpu => {
             // FIX 3 — No GPU mining → budget off LOGICAL cores (all vCPUs), and
@@ -347,12 +383,12 @@ fn select_backend(
                 logical,
                 physical
             );
-            Ok(Box::new(b))
+            Ok((Box::new(b), false))
         }
         Resolved::Gpu => {
             let gpu = gpu_backend.expect("select_mode returned Gpu without a device");
             println!("mode=gpu | backend: {}", gpu.name());
-            Ok(gpu)
+            Ok((gpu, false))
         }
         Resolved::Hybrid => {
             let gpu = gpu_backend.expect("select_mode returned Hybrid without a device");
@@ -366,7 +402,7 @@ fn select_backend(
                      can't leave 2 free AND mine on CPU → running GPU-only."
                 );
                 println!("backend: {}", gpu.name());
-                return Ok(gpu);
+                return Ok((gpu, false));
             }
             let cpu = Box::new(CpuBackend::new(threads));
             let h = HybridBackend::new(cpu, gpu, physical);
@@ -375,7 +411,7 @@ fn select_backend(
                 h.name(),
                 threads
             );
-            Ok(Box::new(h))
+            Ok((Box::new(h), false))
         }
     }
 }

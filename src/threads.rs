@@ -72,9 +72,14 @@ pub fn cpu_only_thread_budget(logical_cores: usize, user_override: Option<usize>
 /// to stay connected and submit occasional shares, cheap enough that N of them
 /// coexist harmlessly. An explicit `--cpu-threads N` overrides the trickle
 /// (clamped to `logical_cores`, same contract as [`cpu_only_thread_budget`]).
+// v0.1.9 review fix: an explicit `--cpu-threads 0` is FLOORED TO 1 here —
+// never-dark is absolute: a 0-thread fallback would bail before connecting,
+// recreating the invisible crash-loop this budget exists to kill. Use
+// `--strict-gpu` to forbid fallback CPU mining entirely. (On an absurd
+// 0-logical-core report the result is still 0 and the caller bails.)
 pub fn cpu_fallback_thread_budget(logical_cores: usize, user_override: Option<usize>) -> usize {
     match user_override {
-        Some(n) => n.min(logical_cores),
+        Some(n) => n.max(1).min(logical_cores),
         None => 2.min(logical_cores),
     }
 }
@@ -176,12 +181,17 @@ mod tests {
     }
 
     /// An explicit `--cpu-threads N` overrides the trickle (the operator chose),
-    /// clamped to the logical ceiling exactly like the CPU-only path.
+    /// clamped to the logical ceiling exactly like the CPU-only path — EXCEPT
+    /// that never-dark is absolute: an explicit 0 is floored to 1 (v0.1.9 review
+    /// fix — a 0-thread fallback would bail before connecting, recreating the
+    /// invisible crash-loop this release exists to kill; `--strict-gpu` is the
+    /// supported way to forbid CPU mining entirely).
     #[test]
     fn fallback_budget_honors_explicit_override_up_to_logical() {
         assert_eq!(cpu_fallback_thread_budget(128, Some(64)), 64);
         assert_eq!(cpu_fallback_thread_budget(128, Some(500)), 128); // clamp
         assert_eq!(cpu_fallback_thread_budget(128, Some(1)), 1); // fewer ok
-        assert_eq!(cpu_fallback_thread_budget(128, Some(0)), 0); // explicit off
+        assert_eq!(cpu_fallback_thread_budget(128, Some(0)), 1); // floored: never dark
+        assert_eq!(cpu_fallback_thread_budget(0, Some(0)), 0); // absurd 0-core box only
     }
 }

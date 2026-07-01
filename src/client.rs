@@ -42,6 +42,18 @@ pub fn advance_cursor(cursor: u64, batch: u32) -> u64 {
     cursor.wrapping_add(batch as u64)
 }
 
+/// v0.1.9 review fix #1 — cap a run's duration (the never-dark fallback TTL).
+/// PURE. The fallback must not LATCH: a transient GPU failure at boot would
+/// otherwise lock the rig into the CPU trickle for the life of the process
+/// (pre-v0.1.9, exit + launcher-restart self-healed transients). Capping the
+/// fallback run makes the process exit cleanly after `cap`; the launcher
+/// restarts it within seconds and the GPU is re-probed — never-dark AND
+/// self-healing. A user `--duration` shorter than the cap still wins.
+#[inline]
+pub fn capped_duration(user: Option<Duration>, cap: Duration) -> Option<Duration> {
+    Some(user.map_or(cap, |d| d.min(cap)))
+}
+
 /// v0.1.9 — average hashes/sec over a window, rounded to whole H/s. PURE.
 /// Degenerate windows (zero/negative elapsed) report 0 instead of dividing by
 /// zero. Feeds the heartbeat's `hs=` field: a rig that is up-but-grinding-nothing
@@ -133,8 +145,9 @@ fn session(
     // v0.1.9 — disable Nagle: submits are tiny single-line writes; coalescing
     // them behind an ACK adds RTT-scale latency exactly when a share (or a
     // block-winning share) should be on the wire immediately. The pool side
-    // already sets nodelay.
-    stream.set_nodelay(true)?;
+    // already sets nodelay. Best-effort (review fix): a platform where this
+    // errored would otherwise kill an otherwise-fine session — never-dark wins.
+    let _ = stream.set_nodelay(true);
     let mut writer = stream.try_clone()?;
     println!("[miner] connected to {addr}");
 
@@ -389,6 +402,31 @@ fn send(w: &mut TcpStream, id: u64, method: &str, params: serde_json::Value) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.1.9 review fix #1 — the never-dark fallback must not LATCH: a
+    /// transient GPU failure at boot would otherwise lock the rig into the CPU
+    /// trickle for its whole life (pre-v0.1.9 the exit+launcher-restart
+    /// self-healed transients). The fallback run is capped so the process exits
+    /// cleanly, the launcher restarts it (seconds), and the GPU is re-probed.
+    /// A user --duration shorter than the cap still wins.
+    #[test]
+    fn capped_duration_bounds_fallback_runs() {
+        let cap = Duration::from_secs(3600);
+        // No user duration → the cap becomes the duration (never None).
+        assert_eq!(capped_duration(None, cap), Some(cap));
+        // User duration longer than the cap → capped.
+        assert_eq!(
+            capped_duration(Some(Duration::from_secs(86_400)), cap),
+            Some(cap)
+        );
+        // User duration shorter than the cap → user wins.
+        assert_eq!(
+            capped_duration(Some(Duration::from_secs(60)), cap),
+            Some(Duration::from_secs(60))
+        );
+        // Equal → same either way.
+        assert_eq!(capped_duration(Some(cap), cap), Some(cap));
+    }
 
     /// v0.1.9 — the heartbeat hashrate: hashes over a window, rounded to whole
     /// H/s; degenerate windows (zero/negative elapsed) report 0 instead of

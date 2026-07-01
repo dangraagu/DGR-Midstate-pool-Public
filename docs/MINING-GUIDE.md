@@ -42,7 +42,7 @@ backend: cpu:x8 (8 threads)
 [miner] connected to midstate.yamaduo.no:3666
 [miner] authorize: true
 [miner] job 1a2b3c midstate=00112233aabb…
-[miner] hb: submitted=3 accepted=3 rejected=0
+[miner] hb: backend=cpu:x8 hs=32 submitted=3 accepted=3 rejected=0 stale_dropped=0
 ```
 
 If you see `authorize: true` and the `accepted=` counter climbing, you're mining.
@@ -191,8 +191,8 @@ backend: cpu:x<N> (<N> threads)
 [miner] connected to {host}:{port}
 [miner] authorize: true
 [miner] job {job_id} midstate={first 6 bytes hex}…
-[miner] hb: submitted={n} accepted={n} rejected={n}
-[miner] FINAL: submitted={n} accepted={n} rejected={n}
+[miner] hb: backend={name} hs={H/s} submitted={n} accepted={n} rejected={n} stale_dropped={n}
+[miner] FINAL: hs_avg={H/s} submitted={n} accepted={n} rejected={n} stale_dropped={n}
 [miner] duration reached, stopping
 ```
 
@@ -211,8 +211,14 @@ no OpenCL GPU found; using CPU      (only on an --features opencl build)
 1. `connected to …` — TCP link to the pool is up.
 2. `authorize: true` — the pool accepted your address.
 3. A stream of `job … midstate=…` lines — the pool is feeding you work.
-4. Every 30 seconds, a heartbeat: `hb: submitted=… accepted=… rejected=…`.
-   **`accepted` climbing = the pool is taking your shares. That's success.**
+4. Every 30 seconds, a heartbeat: `hb: backend=… hs=… submitted=… accepted=…
+   rejected=… stale_dropped=…` (v0.1.9+). **`accepted` climbing = the pool is
+   taking your shares. That's success.** `hs=` is your measured hashrate for the
+   last window — `backend=cpu…` with a low `hs=` on a GPU rig means the miner
+   fell back to CPU (check the warnings above it). `stale_dropped=` counts
+   shares that died because a new job arrived mid-search — a small number is
+   normal; a large fraction of your finds means your search window is too long
+   (see `--gpu-batch`).
 
 ### Working vs idle vs broken
 
@@ -227,7 +233,7 @@ no OpenCL GPU found; using CPU      (only on an --features opencl build)
   loop (can't connect/handshake). See Troubleshooting.
 
 When the miner stops (via `--duration` or Ctrl+C), it prints a final tally:
-`[miner] FINAL: submitted=… accepted=… rejected=…`.
+`[miner] FINAL: hs_avg=… submitted=… accepted=… rejected=… stale_dropped=…`.
 
 ---
 
