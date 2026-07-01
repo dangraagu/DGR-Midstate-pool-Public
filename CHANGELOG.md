@@ -4,6 +4,41 @@ All notable changes to **midstate-pool-miner** are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-07-01
+
+### Fixed
+
+- **NEVER-DARK: a broken GPU backend can no longer make a rig invisible.**
+  Previously, `--mode gpu`/`--mode hybrid` or an explicit `--gpu-id` whose GPU
+  failed to initialize (driver rejects the PTX, CUDA init error, failed bit-exact
+  self-test) made the process exit **before ever connecting to the pool** — the
+  launcher then crash-looped it forever, and the rig was indistinguishable from
+  powered-off. This is exactly the launch configuration `mine-auto.sh` /
+  `mine-multi-gpu.sh` use on multi-GPU rigs (one process per card with
+  `--gpu-id`), so one bad update could silently dark a whole fleet. Now the miner
+  warns LOUDLY on both stdout and stderr and falls back to a reduced CPU miner
+  (`min(2, logical)` threads per process — a visibility trickle, not a CPU
+  takeover; an explicit `--cpu-threads` overrides it), so every worker stays
+  connected, submitting, and visible in the pool's per-address stats. GPU mining
+  itself remains fail-closed: a GPU that cannot prove itself bit-exact never
+  mines. The new `--strict-gpu` flag restores the old exit-with-error contract
+  for rigs where CPU mining must never happen.
+- **Wider CUDA driver compatibility.** The committed kernel PTX `.version` pin
+  dropped 7.8 → 6.5 (CUDA 10.2 ISA), lowering the minimum NVIDIA driver from
+  ~r520 to ~r440 — covering older-driver GPU containers that would previously
+  fail with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (and, pre-never-dark, go
+  invisible). `.target sm_75` is unchanged; the kernel uses only long-stable
+  integer ops. Validated bit-exact on real hardware (RTX 5070 Ti, 5/5 golden
+  vectors, two runs).
+
+### Added
+
+- **Heartbeat hashrate.** The 30-second `[miner] hb:` line now reports
+  `backend=<name> hs=<H/s>` (windowed rate since the previous heartbeat), and
+  the session `FINAL:` line reports `hs_avg=`. A rig that is up-but-not-hashing
+  prints `hs=0` every 30 s in its own launcher log, so a degraded rig is loud
+  locally instead of only visible by inspecting pool-side hashrate.
+
 ## [0.1.8] - 2026-06-29
 
 ### Fixed

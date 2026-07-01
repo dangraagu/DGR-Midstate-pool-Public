@@ -61,6 +61,24 @@ pub fn cpu_only_thread_budget(logical_cores: usize, user_override: Option<usize>
     }
 }
 
+/// v0.1.9 NEVER-DARK — the reduced CPU budget for the gpu/hybrid → CPU fallback.
+///
+/// When an explicit `--mode gpu`/`hybrid`/`--gpu-id` request can't get its GPU
+/// (driver rejects the PTX, self-test fails, bad index), the miner now falls
+/// back to CPU instead of exiting invisible. But the fallback is a VISIBILITY
+/// trickle, not a CPU takeover: a multi-GPU rig runs one process per card, and
+/// if the GPU backend breaks on all of them, N full-width CPU miners would
+/// oversubscribe the box. So: **min(2, logical)** threads per process — enough
+/// to stay connected and submit occasional shares, cheap enough that N of them
+/// coexist harmlessly. An explicit `--cpu-threads N` overrides the trickle
+/// (clamped to `logical_cores`, same contract as [`cpu_only_thread_budget`]).
+pub fn cpu_fallback_thread_budget(logical_cores: usize, user_override: Option<usize>) -> usize {
+    match user_override {
+        Some(n) => n.min(logical_cores),
+        None => 2.min(logical_cores),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +155,33 @@ mod tests {
         assert_eq!(cpu_thread_budget(60, true, Some(120)), 58);
         // hybrid.rs:185 path: cpu_thread_budget(physical, true, None).
         assert_eq!(cpu_thread_budget(12, true, None), 10);
+    }
+
+    // ───────────── v0.1.9 NEVER-DARK — reduced CPU-fallback budget ─────────────
+
+    /// The never-dark fallback budget is a small VISIBILITY trickle, not a CPU
+    /// takeover: with no override it is min(2, logical). Rationale: a multi-GPU
+    /// rig runs one process per card; if the GPU backend breaks on ALL of them,
+    /// N full-width CPU miners would fight each other for the box. 2 threads per
+    /// process keeps every worker connected + submitting without converting a
+    /// rented GPU box into an oversubscribed CPU miner.
+    #[test]
+    fn fallback_budget_is_two_thread_trickle_by_default() {
+        assert_eq!(cpu_fallback_thread_budget(128, None), 2);
+        assert_eq!(cpu_fallback_thread_budget(8, None), 2);
+        assert_eq!(cpu_fallback_thread_budget(2, None), 2);
+        // Tiny boxes: never exceed logical.
+        assert_eq!(cpu_fallback_thread_budget(1, None), 1);
+        assert_eq!(cpu_fallback_thread_budget(0, None), 0);
+    }
+
+    /// An explicit `--cpu-threads N` overrides the trickle (the operator chose),
+    /// clamped to the logical ceiling exactly like the CPU-only path.
+    #[test]
+    fn fallback_budget_honors_explicit_override_up_to_logical() {
+        assert_eq!(cpu_fallback_thread_budget(128, Some(64)), 64);
+        assert_eq!(cpu_fallback_thread_budget(128, Some(500)), 128); // clamp
+        assert_eq!(cpu_fallback_thread_budget(128, Some(1)), 1); // fewer ok
+        assert_eq!(cpu_fallback_thread_budget(128, Some(0)), 0); // explicit off
     }
 }

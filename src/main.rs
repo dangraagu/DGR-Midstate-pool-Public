@@ -5,7 +5,8 @@ use clap::Parser;
 use midstate_miner::client::{run, ClientConfig};
 use midstate_miner::mode::{select_mode, Mode, Resolved};
 use midstate_miner::{
-    cpu_only_thread_budget, cpu_thread_budget, pool_endpoint, Backend, CpuBackend, HybridBackend,
+    cpu_fallback_thread_budget, cpu_only_thread_budget, cpu_thread_budget, pool_endpoint, Backend,
+    CpuBackend, HybridBackend,
 };
 use std::time::Duration;
 
@@ -21,8 +22,10 @@ struct Cli {
     #[arg(long)]
     address: Option<String>,
     /// Mining mode: cpu | gpu | hybrid | auto. `auto` (default) discovers the
-    /// hardware and runs hybrid (CPU+GPU) if a usable OpenCL GPU is present, else
-    /// cpu. `gpu`/`hybrid` error clearly if no GPU is available in this build.
+    /// hardware and runs hybrid (CPU+GPU) if a usable GPU is present, else cpu.
+    /// NEVER-DARK: if `gpu`/`hybrid` can't get a usable GPU, the miner warns
+    /// loudly and falls back to a reduced-thread CPU miner so the rig stays
+    /// visible to the pool (pass --strict-gpu to make it a fatal error instead).
     #[arg(long, default_value = "auto")]
     mode: Mode,
     /// CPU worker threads (default: physical cores; minus 2 if a GPU also mines).
@@ -39,9 +42,10 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     duration: u64,
     /// Pin mining to a specific GPU by its index (see `--list-gpus`). When set, an
-    /// out-of-range or unusable index fails LOUDLY instead of silently falling back
-    /// to CPU — so you always mine the card you asked for, or learn why you can't.
-    /// Used for multi-GPU rigs (one process per `--gpu-id`). Omit for auto-select.
+    /// out-of-range or unusable index warns LOUDLY and falls back to a reduced
+    /// CPU miner (never-dark) so the rig stays visible to the pool; pass
+    /// --strict-gpu to make it exit with an error instead. Used for multi-GPU
+    /// rigs (one process per `--gpu-id`). Omit for auto-select.
     #[arg(long)]
     gpu_id: Option<usize>,
     /// List the GPU adapters this binary can see (index, name, type, backend) and
@@ -54,6 +58,12 @@ struct Cli {
     /// a 4090-class card. Omit to auto-size. No effect on non-CUDA backends.
     #[arg(long)]
     gpu_batch: Option<u32>,
+    /// STRICT GPU: restore the pre-v0.1.9 contract — exit with an error when
+    /// `--mode gpu`/`hybrid` or an explicit `--gpu-id` cannot initialize its GPU,
+    /// instead of the default loud reduced-thread CPU fallback (never-dark).
+    /// Use on rigs where CPU mining must never happen.
+    #[arg(long, default_value_t = false)]
+    strict_gpu: bool,
 }
 
 fn main() -> Result<()> {
@@ -92,6 +102,7 @@ fn main() -> Result<()> {
         cli.cpu_threads,
         cli.gpu_id,
         cli.gpu_batch,
+        cli.strict_gpu,
     )?;
 
     let cfg = ClientConfig {
@@ -158,20 +169,29 @@ fn list_gpus() -> Result<()> {
 }
 
 /// Try to construct a GPU backend. Returns `Ok(Some(b))` on a usable device,
-/// `Ok(None)` if no device/driver, `Err` only on a hard build error. Always
-/// `Ok(None)` when no GPU feature is compiled in (so a CPU-only binary degrades
-/// gracefully instead of failing to build).
+/// `Ok(None)` if no device/driver, `Err` only when `strict` demands a hard fail.
+/// Always `Ok(None)` when no GPU feature is compiled in (so a CPU-only binary
+/// degrades gracefully instead of failing to build).
 ///
 /// PREFERENCE: when multiple GPU features are compiled in, `cuda` (the native path
 /// for these NVIDIA rigs) is tried first, then `wgpu` (Vulkan/DX12/Metal/GL,
-/// checkpointed dispatch — no TDR), then `opencl`. Each is fail-closed: on an
-/// EXPLICIT `--gpu-id` an error propagates (exits 1); on auto a `None` falls
-/// through to the next backend / CPU.
-fn try_gpu_backend(gpu_id: Option<usize>, gpu_batch: Option<u32>) -> Result<Option<Box<dyn Backend>>> {
-    // `gpu_id` is consumed only by the cuda/wgpu arms; in a CPU-only / opencl-only
-    // build it is unused — acknowledge it so there's no unused-variable warning.
+/// checkpointed dispatch — no TDR), then `opencl`. Every failure is fail-closed
+/// for GPU MINING (never mine on a GPU we couldn't prove bit-exact) — but
+/// NEVER-DARK for the process: an init/self-test failure on an explicit
+/// `--gpu-id` propagates `Err` (exit) ONLY under `--strict-gpu`; by default it
+/// warns loudly and falls through, so `select_mode` lands on the reduced CPU
+/// fallback and the rig stays connected + visible to the pool. (Pre-v0.1.9 this
+/// exited before ever opening a socket — the launcher then crash-looped an
+/// INVISIBLE rig, which is how a broken CUDA build could silently dark a fleet.)
+fn try_gpu_backend(
+    gpu_id: Option<usize>,
+    gpu_batch: Option<u32>,
+    strict: bool,
+) -> Result<Option<Box<dyn Backend>>> {
+    // `gpu_id`/`strict` are consumed only by the cuda/wgpu arms; in a CPU-only /
+    // opencl-only build they are unused — acknowledge them (no unused warnings).
     #[cfg(not(any(feature = "cuda", feature = "wgpu")))]
-    let _ = gpu_id;
+    let _ = (gpu_id, strict);
     // `gpu_batch` is consumed only by the cuda arm; ack it in non-cuda builds.
     #[cfg(not(feature = "cuda"))]
     let _ = gpu_batch;
@@ -181,15 +201,24 @@ fn try_gpu_backend(gpu_id: Option<usize>, gpu_batch: Option<u32>) -> Result<Opti
             Ok(Some(b)) => return Ok(Some(Box::new(b))),
             Ok(None) => {} // no usable CUDA device — try wgpu (if built) / opencl / CPU
             Err(e) => {
-                // An EXPLICIT --gpu-id must never silently fall back: a bad index or
-                // an un-initable pinned card / failed self-test is a user error to
-                // surface, not paper over. Propagate it.
-                if gpu_id.is_some() {
+                // --strict-gpu: an explicit --gpu-id that can't init is fatal, as
+                // pre-v0.1.9 (a user error to surface, not paper over).
+                if gpu_id.is_some() && strict {
                     return Err(e);
                 }
-                // Auto-select: device init or self-test failure → never mine on a
-                // GPU we couldn't prove bit-exact. Treat as no-GPU, fall through.
-                eprintln!("cuda init/self-test failed: {e}; treating as no-cuda-GPU");
+                // NEVER-DARK default: warn loudly and fall through. GPU mining is
+                // still fail-closed (we never mine on an unproven GPU) — but the
+                // process survives to reach the CPU fallback and stay visible.
+                if gpu_id.is_some() {
+                    eprintln!("cuda init/self-test FAILED on explicit --gpu-id: {e}");
+                    eprintln!(
+                        "never-dark: NOT exiting — falling back so this rig stays visible \
+                         to the pool (pass --strict-gpu to make this fatal)"
+                    );
+                } else {
+                    // Auto-select: treat as no-GPU, fall through.
+                    eprintln!("cuda init/self-test failed: {e}; treating as no-cuda-GPU");
+                }
             }
         }
     }
@@ -199,15 +228,19 @@ fn try_gpu_backend(gpu_id: Option<usize>, gpu_batch: Option<u32>) -> Result<Opti
             Ok(Some(b)) => return Ok(Some(Box::new(b))),
             Ok(None) => {} // no usable wgpu adapter — try opencl (if built) / CPU
             Err(e) => {
-                // An EXPLICIT --gpu-id must never silently fall back to CPU: a bad
-                // index or an un-initable pinned card is a user error to surface,
-                // not paper over. Propagate it.
-                if gpu_id.is_some() {
+                // Same never-dark contract as the cuda arm above.
+                if gpu_id.is_some() && strict {
                     return Err(e);
                 }
-                // Auto-select: device/shader init or self-test failure → never mine
-                // on a GPU we couldn't prove bit-exact. Treat as no-GPU, fall through.
-                eprintln!("wgpu init/self-test failed: {e}; treating as no-wgpu-GPU");
+                if gpu_id.is_some() {
+                    eprintln!("wgpu init/self-test FAILED on explicit --gpu-id: {e}");
+                    eprintln!(
+                        "never-dark: NOT exiting — falling back so this rig stays visible \
+                         to the pool (pass --strict-gpu to make this fatal)"
+                    );
+                } else {
+                    eprintln!("wgpu init/self-test failed: {e}; treating as no-wgpu-GPU");
+                }
             }
         }
     }
@@ -231,8 +264,9 @@ fn try_gpu_backend(gpu_id: Option<usize>, gpu_batch: Option<u32>) -> Result<Opti
 ///
 /// Mode handling (see [`select_mode`]):
 /// - `cpu`    → CPU backend (all cores; no GPU touched).
-/// - `gpu`    → OpenCL backend alone; a clear error if no usable GPU / not built.
-/// - `hybrid` → CPU + GPU concurrently; error if no usable GPU / not built.
+/// - `gpu`    → GPU backend alone; no usable GPU → LOUD reduced-thread CPU
+///   fallback (never-dark), or a clear error under `--strict-gpu`.
+/// - `hybrid` → CPU + GPU concurrently; same never-dark fallback rule.
 /// - `auto`   → hybrid if a usable GPU exists, else cpu (never errors).
 fn select_backend(
     requested: Mode,
@@ -241,14 +275,15 @@ fn select_backend(
     cpu_threads: Option<usize>,
     gpu_id: Option<usize>,
     gpu_batch: Option<u32>,
+    strict_gpu: bool,
 ) -> Result<Box<dyn Backend>> {
     // --- AUTO-DISCOVER ------------------------------------------------------
     // Probe for a GPU only when the request could USE one (cpu mode never probes,
-    // so a forced-CPU run on a GPU-less box does zero OpenCL work). We construct
+    // so a forced-CPU run on a GPU-less box does zero GPU work). We construct
     // the device once and reuse it for hybrid/gpu so we don't init twice.
     let mut gpu_backend: Option<Box<dyn Backend>> = None;
     if matches!(requested, Mode::Gpu | Mode::Hybrid | Mode::Auto) {
-        gpu_backend = try_gpu_backend(gpu_id, gpu_batch)?;
+        gpu_backend = try_gpu_backend(gpu_id, gpu_batch, strict_gpu)?;
     }
     let gpu_present = gpu_backend.is_some();
     let gpu_label = gpu_backend.as_deref().map(|b| b.name().to_string());
@@ -263,9 +298,40 @@ fn select_backend(
             .unwrap_or_default()
     );
 
-    let resolved = select_mode(requested, GPU_BUILT, gpu_present);
+    let resolved = select_mode(requested, GPU_BUILT, gpu_present, strict_gpu);
     match resolved {
         Resolved::Error(msg) => bail!("{msg}"),
+        Resolved::CpuFallback(reason) => {
+            // NEVER-DARK (v0.1.9): a gpu/hybrid request without a usable GPU used
+            // to exit BEFORE connecting — the launcher then crash-looped an
+            // INVISIBLE rig (indistinguishable from powered-off; how a broken
+            // CUDA build could silently dark a whole fleet). Instead: warn LOUDLY
+            // on both streams (launcher logs capture stdout; humans tail stderr)
+            // and mine on CPU with a REDUCED budget. Reduced because a multi-GPU
+            // rig runs one process per card — N full-width CPU miners would fight
+            // for the box; min(2, logical) per process keeps every worker
+            // connected + submitting without converting the rig to CPU mining.
+            eprintln!("WARNING: {reason}");
+            eprintln!(
+                "WARNING: never-dark fallback — mining on CPU (reduced threads) so this rig \
+                 stays VISIBLE to the pool. Pass --strict-gpu to make this a fatal error, \
+                 or --mode cpu for a full-width CPU miner."
+            );
+            println!("WARNING: {reason} → never-dark CPU fallback (reduced threads)");
+            let threads = cpu_fallback_thread_budget(logical, cpu_threads);
+            if threads == 0 {
+                bail!("0 CPU threads after fallback budget — nothing to mine");
+            }
+            let b = CpuBackend::new(threads);
+            println!(
+                "mode=cpu-FALLBACK | backend: {} ({} threads of {} logical; reduced \
+                 never-dark budget)",
+                b.name(),
+                threads,
+                logical
+            );
+            Ok(Box::new(b))
+        }
         Resolved::Cpu => {
             // FIX 3 — No GPU mining → budget off LOGICAL cores (all vCPUs), and
             // honor a --cpu-threads override UP TO logical (it may exceed physical).

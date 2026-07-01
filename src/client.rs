@@ -42,6 +42,19 @@ pub fn advance_cursor(cursor: u64, batch: u32) -> u64 {
     cursor.wrapping_add(batch as u64)
 }
 
+/// v0.1.9 — average hashes/sec over a window, rounded to whole H/s. PURE.
+/// Degenerate windows (zero/negative elapsed) report 0 instead of dividing by
+/// zero. Feeds the heartbeat's `hs=` field: a rig that is up-but-grinding-nothing
+/// prints `hs=0` every 30s, so a darkened/degraded rig is loud in its own
+/// launcher log instead of looking identical to a healthy one.
+#[inline]
+pub fn windowed_rate(hashes: u64, secs: f64) -> u64 {
+    if secs <= 0.0 {
+        return 0;
+    }
+    (hashes as f64 / secs).round() as u64
+}
+
 pub struct ClientConfig {
     pub host: String,
     pub port: u16,
@@ -58,6 +71,9 @@ struct Shared {
     submitted: AtomicU64,
     accepted: AtomicU64,
     rejected: AtomicU64,
+    // v0.1.9 — nonces ground this session (each search window adds its batch).
+    // Feeds the heartbeat `hs=` field so "up but not hashing" is visible.
+    hashes: AtomicU64,
 }
 
 /// Supervisor: run forever (or until `duration`), reconnecting on any error.
@@ -119,7 +135,11 @@ fn session(
         submitted: AtomicU64::new(0),
         accepted: AtomicU64::new(0),
         rejected: AtomicU64::new(0),
+        hashes: AtomicU64::new(0),
     });
+    // v0.1.9 — session-relative clock for the FINAL session-average hashrate
+    // (`start` is the process-lifetime clock and spans reconnects).
+    let session_start = Instant::now();
 
     // Handshake: authorize (this fn is the only writer until the loop below).
     send(
@@ -210,6 +230,7 @@ fn session(
     // away.
     let mut cursor: u64 = nonce_base;
     let mut last_hb = Instant::now();
+    let mut last_hb_hashes: u64 = 0; // v0.1.9 — hashes total at the last heartbeat
     let res = (|| -> Result<()> {
         loop {
             if shared.stop.load(Ordering::Relaxed) {
@@ -243,6 +264,8 @@ fn session(
             let batch = backend.suggested_batch();
             let found = backend.search(&job.midstate, target, cursor, batch)?;
             cursor = advance_cursor(cursor, batch);
+            // v0.1.9 — count the nonces this window ground (the heartbeat's hs=).
+            shared.hashes.fetch_add(batch as u64, Ordering::Relaxed);
 
             // Stale-share guard: if the epoch advanced WHILE we were searching, a
             // new job arrived and these `found` were computed for the OLD midstate.
@@ -269,9 +292,21 @@ fn session(
             }
 
             if last_hb.elapsed() >= Duration::from_secs(30) {
+                // v0.1.9 — WINDOWED hashrate since the last heartbeat: a rig that
+                // stopped grinding shows hs=0 on the very next line, not a slowly
+                // decaying session average. backend name included so long logs
+                // show WHAT is producing that rate (cuda vs cpu-fallback).
+                let total = shared.hashes.load(Ordering::Relaxed);
+                let hs = windowed_rate(
+                    total.saturating_sub(last_hb_hashes),
+                    last_hb.elapsed().as_secs_f64(),
+                );
+                last_hb_hashes = total;
                 last_hb = Instant::now();
                 println!(
-                    "[miner] hb: submitted={} accepted={} rejected={}",
+                    "[miner] hb: backend={} hs={} submitted={} accepted={} rejected={}",
+                    backend.name(),
+                    hs,
                     shared.submitted.load(Ordering::Relaxed),
                     shared.accepted.load(Ordering::Relaxed),
                     shared.rejected.load(Ordering::Relaxed)
@@ -284,7 +319,11 @@ fn session(
     let _ = writer.shutdown(std::net::Shutdown::Both); // unblock the reader
     let _ = reader_handle.join();
     println!(
-        "[miner] FINAL: submitted={} accepted={} rejected={}",
+        "[miner] FINAL: hs_avg={} submitted={} accepted={} rejected={}",
+        windowed_rate(
+            shared.hashes.load(Ordering::Relaxed),
+            session_start.elapsed().as_secs_f64(),
+        ),
         shared.submitted.load(Ordering::Relaxed),
         shared.accepted.load(Ordering::Relaxed),
         shared.rejected.load(Ordering::Relaxed)
@@ -304,6 +343,22 @@ fn send(w: &mut TcpStream, id: u64, method: &str, params: serde_json::Value) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.1.9 — the heartbeat hashrate: hashes over a window, rounded to whole
+    /// H/s; degenerate windows (zero/negative elapsed) report 0 instead of
+    /// dividing by zero. THE observability contract: a rig grinding nothing
+    /// prints hs=0, which is what makes a darkened/degraded rig loud in its log.
+    #[test]
+    fn windowed_rate_basic_and_degenerate() {
+        assert_eq!(windowed_rate(30_000, 30.0), 1_000);
+        assert_eq!(windowed_rate(0, 30.0), 0); // idle rig shows hs=0
+        assert_eq!(windowed_rate(1, 0.0), 0); // degenerate window → 0, no panic
+        assert_eq!(windowed_rate(1, -5.0), 0); // negative guard → 0
+        assert_eq!(windowed_rate(15, 30.0), 1); // 0.5 rounds to 1 (round, not trunc)
+        assert_eq!(windowed_rate(14, 30.0), 0); // 0.466… rounds to 0
+        // GPU-scale sanity: ~20k H/s over 30s.
+        assert_eq!(windowed_rate(600_000, 30.0), 20_000);
+    }
 
     /// FIX 2 — the per-rig nonce base is random (non-zero with overwhelming
     /// probability) and two independently-seeded bases differ. Seeded from OS
