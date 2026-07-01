@@ -524,13 +524,22 @@ start_miners() {
   done
 }
 
-# Are any of our launched miners still alive?
+# Are ALL of our launched miners still alive?
+# v0.1.9 deploy-check fix (F2): this was ANY-alive, which on a multi-GPU rig
+# meant a single dead worker (crash, or the never-dark fallback's 1800s
+# re-probe exit) was NEVER respawned while a sibling lived — that worker's
+# card sat dark until the next release bounced the set. Now any dead worker
+# fails liveness -> the supervisor bounces the WHOLE set (healthy siblings
+# lose seconds per cycle, and every card gets re-probed — which is exactly
+# what the never-dark TTL exit is for). An empty set still reports not-running.
 miners_running() {
-  local p
+  local p any=0
   for p in "${PIDS[@]:-}"; do
-    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && return 0
+    [ -n "$p" ] || continue
+    any=1
+    kill -0 "$p" 2>/dev/null || return 1
   done
-  return 1
+  [ "$any" -eq 1 ]
 }
 
 # Run the optional operator crash hook (driver reset, reboot, etc.) once.

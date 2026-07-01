@@ -33,9 +33,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - **Never-dark details (adversarial-review hardening).** (a) Fallback runs are
   TIME-CAPPED at 30 minutes: the process exits cleanly, the launcher restarts
-  it within seconds, and the GPU is re-probed — so a *transient* GPU failure at
-  boot cannot latch a rig into the CPU trickle forever (a permanent failure just
-  cycles visible-fallback → re-probe). A shorter user `--duration` still wins.
+  it when it notices the worker down (its normal liveness loop), and the GPU is
+  re-probed — so a *transient* GPU failure at boot cannot latch a rig into the
+  CPU trickle forever (a permanent failure just cycles visible-fallback →
+  re-probe). A shorter user `--duration` still wins. To make this true on
+  multi-GPU rigs, `mine-auto.sh`'s liveness check is now ALL-workers-alive
+  (was ANY-alive): one dead worker — a crash or the TTL re-probe exit —
+  bounces the whole set, so a single broken card can no longer leave its
+  worker permanently un-respawned while siblings mine.
   (b) An explicit `--gpu-id` under the default `--mode auto` is treated as
   GPU-intent: if the pinned GPU fails, the rig gets the *reduced* fallback (or
   an error under `--strict-gpu`), never a full-width all-cores CPU miner — one

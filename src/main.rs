@@ -323,6 +323,7 @@ fn select_backend(
     // (or Error under --strict-gpu). Healthy pinned paths are untouched.
     let resolved = adjust_auto_pinned(
         select_mode(requested, GPU_BUILT, gpu_present, strict_gpu),
+        requested,
         gpu_id.is_some(),
         strict_gpu,
     );

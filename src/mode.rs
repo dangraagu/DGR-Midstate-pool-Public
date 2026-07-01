@@ -144,16 +144,18 @@ pub fn select_mode(requested: Mode, gpu_built: bool, gpu_present: bool, strict: 
 /// [`Resolved::Cpu`] (all logical cores) — on a broken multi-GPU rig running one
 /// process per card that is N full-width CPU miners, not the reduced never-dark
 /// trickle. This adjusts exactly that one cell:
-/// - `pinned` (an explicit `--gpu-id` was given) AND the resolution landed on
-///   plain `Cpu` (i.e. the pinned GPU did not survive) → the reduced
-///   [`Resolved::CpuFallback`] (default) or [`Resolved::Error`] (strict).
-/// - Everything else (not pinned, GPU healthy, already a fallback/error) is
-///   returned untouched — the healthy pinned path stays bit-identical.
-pub fn adjust_auto_pinned(resolved: Resolved, pinned: bool, strict: bool) -> Resolved {
-    const PINNED_REASON: &str = "explicit --gpu-id: the pinned GPU could not initialize \
-         (see the failure above)";
+/// - the requested mode was `Auto` AND `pinned` (an explicit `--gpu-id`) AND the
+///   resolution landed on plain `Cpu` (the pinned GPU did not survive) → the
+///   reduced [`Resolved::CpuFallback`] (default) or [`Resolved::Error`] (strict).
+/// - Everything else is untouched. In particular a REQUESTED `--mode cpu` (or
+///   legacy `--cpu`) with a stray `--gpu-id` stays a full-width CPU run — cpu
+///   mode never probes the GPU, so there is no failure to react to (deploy-check
+///   gate fix F1), and the healthy pinned path stays bit-identical.
+pub fn adjust_auto_pinned(resolved: Resolved, requested: Mode, pinned: bool, strict: bool) -> Resolved {
+    const PINNED_REASON: &str = "explicit --gpu-id: no usable GPU for the pinned index \
+         (see any failure printed above)";
     match resolved {
-        Resolved::Cpu if pinned => {
+        Resolved::Cpu if pinned && matches!(requested, Mode::Auto) => {
             if strict {
                 Resolved::Error(PINNED_REASON)
             } else {
@@ -290,15 +292,35 @@ mod tests {
     #[test]
     fn auto_pinned_gpu_failure_is_reduced_fallback_not_full_cpu() {
         // auto + pinned + GPU failed (resolved Cpu) → reduced fallback.
-        match adjust_auto_pinned(Resolved::Cpu, true, false) {
+        match adjust_auto_pinned(Resolved::Cpu, Mode::Auto, true, false) {
             Resolved::CpuFallback(m) => assert!(m.contains("--gpu-id")),
             other => panic!("expected CpuFallback, got {other:?}"),
         }
         // strict: same situation → Error.
-        match adjust_auto_pinned(Resolved::Cpu, true, true) {
+        match adjust_auto_pinned(Resolved::Cpu, Mode::Auto, true, true) {
             Resolved::Error(m) => assert!(m.contains("--gpu-id")),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    /// Deploy-check gate fix (F1): `--mode cpu --gpu-id N` (or legacy `--cpu
+    /// --gpu-id N`) is a REQUESTED CPU run — the GPU is never probed, so the
+    /// pin must NOT demote it to the trickle/TTL (default) or a startup Error
+    /// (strict). Only the AUTO cell is adjusted; cpu keeps full-width CPU,
+    /// exactly as the --strict-gpu help text promises.
+    #[test]
+    fn cpu_mode_with_pinned_gpu_id_is_untouched() {
+        for &strict in &[false, true] {
+            assert_eq!(
+                adjust_auto_pinned(Resolved::Cpu, Mode::Cpu, true, strict),
+                Resolved::Cpu,
+                "requested cpu + --gpu-id must stay full-width Cpu (strict={strict})"
+            );
+        }
+        // Gpu/Hybrid requests never resolve to Cpu, but if they somehow did,
+        // the adjust must not fire for them either (gate is Auto-only).
+        assert_eq!(adjust_auto_pinned(Resolved::Cpu, Mode::Gpu, true, false), Resolved::Cpu);
+        assert_eq!(adjust_auto_pinned(Resolved::Cpu, Mode::Hybrid, true, true), Resolved::Cpu);
     }
 
     #[test]
@@ -311,18 +333,24 @@ mod tests {
             Resolved::CpuFallback("x"),
             Resolved::Error("y"),
         ] {
-            assert_eq!(adjust_auto_pinned(r, false, false), r);
-            assert_eq!(adjust_auto_pinned(r, false, true), r);
+            assert_eq!(adjust_auto_pinned(r, Mode::Auto, false, false), r);
+            assert_eq!(adjust_auto_pinned(r, Mode::Auto, false, true), r);
         }
         // Pinned but the GPU WORKED (Hybrid via auto) → identity.
-        assert_eq!(adjust_auto_pinned(Resolved::Hybrid, true, false), Resolved::Hybrid);
-        assert_eq!(adjust_auto_pinned(Resolved::Gpu, true, true), Resolved::Gpu);
+        assert_eq!(
+            adjust_auto_pinned(Resolved::Hybrid, Mode::Auto, true, false),
+            Resolved::Hybrid
+        );
+        assert_eq!(adjust_auto_pinned(Resolved::Gpu, Mode::Auto, true, true), Resolved::Gpu);
         // Pinned + already a fallback/error → identity (no double-wrap).
         assert_eq!(
-            adjust_auto_pinned(Resolved::CpuFallback("x"), true, false),
+            adjust_auto_pinned(Resolved::CpuFallback("x"), Mode::Auto, true, false),
             Resolved::CpuFallback("x")
         );
-        assert_eq!(adjust_auto_pinned(Resolved::Error("y"), true, true), Resolved::Error("y"));
+        assert_eq!(
+            adjust_auto_pinned(Resolved::Error("y"), Mode::Auto, true, true),
+            Resolved::Error("y")
+        );
     }
 
     /// Exhaustive 4(mode)×2(built)×2(present)×2(strict) matrix — every cell
