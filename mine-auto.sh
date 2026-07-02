@@ -18,12 +18,11 @@ set -euo pipefail
 #   * Checks GitHub for the latest release every CHECK_MIN
 #     minutes. A new version is gated through THREE checks before
 #     it ever runs (brick-safe hardening):
-#       1. semver compare (the miner's own `check-update`, so
-#          0.1.10 is correctly newer than 0.1.9 — a string "!="
-#          got this wrong),
+#       1. version gate: plain string compare — update only when
+#          the published version differs from the installed one,
 #       2. download to a TEMP path (never onto the live binary),
-#       3. SHA-256 verify against the release SHA256SUMS (the
-#          miner's own `verify-file`) BEFORE the atomic swap.
+#       3. SHA-256 verify against the release SHA256SUMS (OS
+#          sha256sum) BEFORE the atomic swap.
 #     A failed verify discards the temp and keeps the running
 #     binary; the rig never executes an unverified download.
 #   * Liveness is checked on a SHORT cadence (LIVE_SEC), decoupled
@@ -188,22 +187,14 @@ latest_tag() {
   printf '%s' "${out#v}"
 }
 
-# Decide whether $LATEST is newer than $INSTALLED. Prefer the miner's OWN
-# `check-update` subcommand (one tested semver compare: 0.1.10 > 0.1.9), so the
-# shell does not re-implement a fragile string compare. If the currently-
-# installed binary is missing or too old to support the subcommand
-# (chicken-and-egg on the very first hardened update), fall back to a plain
-# string inequality. Returns 0 (update) / non-zero (skip).
+# Decide whether to update: plain string inequality between $INSTALLED and
+# $LATEST. Both are release-tag strings from the same source (latest-version.txt
+# / the value recorded after the last swap; "none" before the first install), so
+# "differs" means "a different release is published". The binary has no
+# subcommands (flat clap parser) — there is no semver compare to call.
+# Returns 0 (update) / non-zero (skip).
 should_update() {
   local installed="$1" latest="$2"
-  if [ -x "$BIN" ] && "$BIN" check-update --current "$installed" --latest "$latest" >/dev/null 2>&1; then
-    return 0   # subcommand present and says: newer
-  fi
-  # Subcommand present but exited non-zero == up-to-date/older: do NOT update.
-  if [ -x "$BIN" ] && "$BIN" check-update --help >/dev/null 2>&1; then
-    return 1
-  fi
-  # No usable binary yet (first run) or it predates check-update: string fallback.
   [ "$installed" != "$latest" ]
 }
 
@@ -225,9 +216,9 @@ expected_sha() {
 # it into $BIN. Never writes an unverified binary onto the live path:
 #   1. download to a staging path "$BIN.new",
 #   2. look up the expected SHA-256 from the release SHA256SUMS,
-#   3. `verify-file` the staging copy (the miner's own tested check); if the
-#      digest matches, mv it into place; if it does NOT match, discard the
-#      staging copy and keep the running binary (return non-zero),
+#   3. SHA-256 the staging copy with the OS sha256sum; if the digest matches,
+#      mv it into place; if it does NOT match, discard the staging copy and
+#      keep the running binary (return non-zero),
 #   4. if no SHA256SUMS is published, FAIL CLOSED — refuse the swap and keep the
 #      running binary (never accept an unverified download).
 # If a non-cpu variant's asset is missing (404), fall back to the cpu build
@@ -274,18 +265,11 @@ download_verify_swap() {
     rm -f "$staged"
     return 1
   else
-    # Verify with a TRUSTED tool ONLY: the already-running $BIN (if it supports
-    # verify-file) or the OS sha256sum. NEVER let the just-downloaded $staged
-    # verify itself — a malicious download would simply pass its own check. And
-    # if we have a digest but NO trusted verifier, FAIL CLOSED (refuse the swap)
-    # rather than run an unverified binary.
-    if [ -x "$BIN" ] && "$BIN" verify-file --help >/dev/null 2>&1; then
-      if ! "$BIN" verify-file "$staged" "$want" >/dev/null 2>&1; then
-        echo "[X] SHA-256 verify FAILED for the downloaded $BIN_NAME - discarding it and keeping the running binary." >&2
-        rm -f "$staged"
-        return 1
-      fi
-    elif command -v sha256sum >/dev/null 2>&1; then
+    # Verify with a TRUSTED tool ONLY: the OS sha256sum. NEVER let the
+    # just-downloaded $staged verify itself — a malicious download would simply
+    # pass its own check. And if we have a digest but NO trusted verifier, FAIL
+    # CLOSED (refuse the swap) rather than run an unverified binary.
+    if command -v sha256sum >/dev/null 2>&1; then
       local got
       got="$(sha256sum "$staged" | awk '{print $1}')"
       if [ "$got" != "$want" ]; then
@@ -294,7 +278,7 @@ download_verify_swap() {
         return 1
       fi
     else
-      echo "[X] have a SHA256SUMS digest but no trusted verifier (no running verify-file, no sha256sum) - refusing the update." >&2
+      echo "[X] have a SHA256SUMS digest but no trusted verifier (no sha256sum) - refusing the update." >&2
       rm -f "$staged"
       return 1
     fi
@@ -335,11 +319,10 @@ SELF_NAME="mine-auto.sh"   # the release-asset basename + the SHA256SUMS key
 #     loaded (old) script text, so this launch can never be bricked by the swap.
 #     We also keep "$SELF_PATH.bak" (the prior launcher) as a manual fallback.
 #
-# Verifier trust: we verify with the just-swapped, already-SHA-verified $BIN
-# ("$BIN verify-file") or the OS sha256sum — NEVER by letting the downloaded
-# script check itself. Returns non-zero on any skip/failure; the caller treats
-# this as purely best-effort and ignores the result (a launcher-update failure
-# must never disturb mining).
+# Verifier trust: we verify with the OS sha256sum — NEVER by letting the
+# downloaded script check itself. Returns non-zero on any skip/failure; the
+# caller treats this as purely best-effort and ignores the result (a
+# launcher-update failure must never disturb mining).
 update_launcher_self() {
   local staged want got cur
   staged="$SELF_PATH.new.$$"
@@ -362,14 +345,8 @@ update_launcher_self() {
   fi
 
   # 3. Verify the temp with a TRUSTED verifier (never the downloaded script
-  #    itself). Prefer the freshly-verified $BIN; else OS sha256sum; else refuse.
-  if [ -x "$BIN" ] && "$BIN" verify-file --help >/dev/null 2>&1; then
-    if ! "$BIN" verify-file "$staged" "$want" >/dev/null 2>&1; then
-      echo "[$(date '+%H:%M:%S')] launcher self-update: SHA-256 verify FAILED for $SELF_NAME — discarding, keeping on-disk launcher." >&2
-      rm -f "$staged"
-      return 1
-    fi
-  elif command -v sha256sum >/dev/null 2>&1; then
+  #    itself): the OS sha256sum; if it is unavailable, refuse.
+  if command -v sha256sum >/dev/null 2>&1; then
     got="$(sha256sum "$staged" | awk '{print $1}')"
     if [ "$got" != "$want" ]; then
       echo "[$(date '+%H:%M:%S')] launcher self-update: SHA-256 verify FAILED for $SELF_NAME (got $got, want $want) — discarding." >&2

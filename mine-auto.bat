@@ -20,14 +20,13 @@ REM     in ONE process; the binary's --mode picks cpu/gpu/hybrid/auto.
 REM   * Checks GitHub for the latest release every CHECK_MIN
 REM     minutes. A new version is gated through THREE checks
 REM     before it ever runs (brick-safe hardening):
-REM       1. semver compare (the miner's own `check-update`, so
-REM          0.1.10 is correctly newer than 0.1.9 - a string
-REM          compare got this wrong),
+REM       1. version gate: plain string compare - update only when
+REM          the published version differs from the installed one,
 REM       2. download to a TEMP path "%BIN%.new" (NEVER onto the
 REM          live running binary - a partial download onto %BIN%
 REM          would corrupt it),
-REM       3. SHA-256 verify against the release SHA256SUMS (the
-REM          miner's own `verify-file`) BEFORE the atomic swap.
+REM       3. SHA-256 verify against the release SHA256SUMS
+REM          (PowerShell Get-FileHash) BEFORE the atomic swap.
 REM     A failed verify deletes the temp and keeps the running
 REM     binary; the rig never executes an unverified download.
 REM   * Liveness is checked on a SHORT cadence (LIVE_SEC),
@@ -303,23 +302,13 @@ set "LATEST="
 for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "try { $t=(Invoke-WebRequest -Uri 'https://github.com/%REPO%/releases/latest/download/latest-version.txt' -Headers @{'User-Agent'='midstate-miner'} -UseBasicParsing).Content; ($t -split \"`n\")[0].Trim().TrimStart('v') } catch { '' }"`) do set "LATEST=%%v"
 if not defined LATEST goto :eof
 
-REM Decide whether LATEST is newer than INSTALLED. Prefer the miner's OWN
-REM check-update (one tested semver compare: 0.1.10 > 0.1.9). If the installed
-REM binary is missing or predates the subcommand (first hardened update), fall
-REM back to a plain string inequality.
+REM Decide whether to update: plain string inequality between INSTALLED and
+REM LATEST. Both are release-tag strings from the same source (latest-version.txt
+REM / the value recorded after the last swap; "none" before the first install),
+REM so "differs" means "a different release is published". The binary has no
+REM subcommands (flat clap parser) - there is no semver compare to call.
 set "DOUPDATE=0"
-if exist "%BIN%" (
-  "%BIN%" check-update --help >nul 2>&1
-  if !errorlevel!==0 (
-    REM Subcommand present: exit 0 means "update available".
-    "%BIN%" check-update --current "!INSTALLED!" --latest "!LATEST!" >nul 2>&1
-    if !errorlevel!==0 ( set "DOUPDATE=1" )
-  ) else (
-    if not "!LATEST!"=="!INSTALLED!" set "DOUPDATE=1"
-  )
-) else (
-  if not "!LATEST!"=="!INSTALLED!" set "DOUPDATE=1"
-)
+if not "!LATEST!"=="!INSTALLED!" set "DOUPDATE=1"
 if "!DOUPDATE!"=="0" goto :eof
 
 echo [%time%] update: !INSTALLED! -^> !LATEST!  ^(verify, then swap + restart^)
@@ -398,12 +387,9 @@ if exist "!SUMS!" (
   del /f /q "!SUMS!" >nul 2>&1
 )
 
-REM 3. Verify before swapping. Prefer the TRUSTED running %BIN%'s verify-file -
-REM    never let the just-downloaded staged binary verify itself (a malicious
-REM    download would pass its own check). If %BIN% is absent or PREDATES the
-REM    verify-file subcommand, fall back to PowerShell Get-FileHash as the OS
-REM    trusted verifier - so a pre-verify-file rig can still verify + auto-advance
-REM    instead of freezing forever on the old binary.
+REM 3. Verify before swapping, with a TRUSTED verifier: PowerShell Get-FileHash
+REM    (the OS tool) - never let the just-downloaded staged binary verify itself
+REM    (a malicious download would pass its own check).
 REM FAIL CLOSED. No SHA256SUMS (or %EXE% not listed), a hash mismatch, or no usable
 REM verifier at all REFUSE the update and keep whatever %BIN% exists. Live releases
 REM always publish SHA256SUMS, so a missing one is anomalous, not routine. We NEVER
@@ -413,34 +399,19 @@ if not defined WANT (
   del /f /q "!NEWBIN!" >nul 2>&1
   goto :eof
 )
-set "VERIFIED=0"
-if exist "%BIN%" (
-  "%BIN%" verify-file --help >nul 2>&1
-  if !errorlevel!==0 (
-    "%BIN%" verify-file "!NEWBIN!" "!WANT!" >nul 2>&1
-    if !errorlevel!==0 ( set "VERIFIED=1" ) else (
-      echo [%time%] [X] SHA-256 verify FAILED for %EXE% - discarding it, keeping the running binary.
-      del /f /q "!NEWBIN!" >nul 2>&1
-      goto :eof
-    )
-  )
+REM Use PowerShell Get-FileHash as the OS verifier. FAIL CLOSED if it is
+REM unavailable (empty hash) or the digest does not match.
+set "GOT="
+for /f "usebackq delims=" %%h in (`powershell -NoProfile -Command "try { (Get-FileHash -Algorithm SHA256 -LiteralPath '!NEWBIN!').Hash.ToLower() } catch { '' }"`) do set "GOT=%%h"
+if not defined GOT (
+  echo [%time%] [X] refusing unverified update: have a SHA256SUMS digest but no usable verifier ^(Get-FileHash failed^). Keeping current.
+  del /f /q "!NEWBIN!" >nul 2>&1
+  goto :eof
 )
-if "!VERIFIED!"=="0" (
-  REM No trusted running-binary verifier (first install, or %BIN% predates
-  REM verify-file). Use PowerShell Get-FileHash as the OS verifier. FAIL CLOSED if
-  REM it is unavailable (empty hash) or the digest does not match.
-  set "GOT="
-  for /f "usebackq delims=" %%h in (`powershell -NoProfile -Command "try { (Get-FileHash -Algorithm SHA256 -LiteralPath '!NEWBIN!').Hash.ToLower() } catch { '' }"`) do set "GOT=%%h"
-  if not defined GOT (
-    echo [%time%] [X] refusing unverified update: have a SHA256SUMS digest but no usable verifier ^(no verify-file, Get-FileHash failed^). Keeping current.
-    del /f /q "!NEWBIN!" >nul 2>&1
-    goto :eof
-  )
-  if /i not "!GOT!"=="!WANT!" (
-    echo [%time%] [X] SHA-256 verify FAILED for %EXE% ^(got !GOT! want !WANT!^) - discarding it.
-    del /f /q "!NEWBIN!" >nul 2>&1
-    goto :eof
-  )
+if /i not "!GOT!"=="!WANT!" (
+  echo [%time%] [X] SHA-256 verify FAILED for %EXE% ^(got !GOT! want !WANT!^) - discarding it.
+  del /f /q "!NEWBIN!" >nul 2>&1
+  goto :eof
 )
 
 REM 4. Verified: stop miners, atomically swap the temp onto the live path, restart.
@@ -516,33 +487,19 @@ if not defined SELF_WANT (
 )
 
 REM 3. Verify the temp with a TRUSTED verifier (never let the download verify
-REM    itself). Prefer the freshly-swapped %BIN% verify-file; else PowerShell
-REM    Get-FileHash (OS verifier). FAIL-CLOSED on mismatch or no verifier.
-set "SELF_VERIFIED=0"
-if exist "%BIN%" (
-  "%BIN%" verify-file --help >nul 2>&1
-  if !errorlevel!==0 (
-    "%BIN%" verify-file "!SELF_DL!" "!SELF_WANT!" >nul 2>&1
-    if !errorlevel!==0 ( set "SELF_VERIFIED=1" ) else (
-      echo [%time%] launcher self-update: SHA-256 verify FAILED for %SELF_NAME% - discarding, keeping current launcher.
-      del /f /q "!SELF_DL!" >nul 2>&1
-      goto :eof
-    )
-  )
+REM    itself): PowerShell Get-FileHash (OS verifier). FAIL-CLOSED on mismatch
+REM    or no verifier.
+set "SELF_GOT="
+for /f "usebackq delims=" %%h in (`powershell -NoProfile -Command "try { (Get-FileHash -Algorithm SHA256 -LiteralPath '!SELF_DL!').Hash.ToLower() } catch { '' }"`) do set "SELF_GOT=%%h"
+if not defined SELF_GOT (
+  echo [%time%] launcher self-update: have a digest but no usable verifier - refusing.
+  del /f /q "!SELF_DL!" >nul 2>&1
+  goto :eof
 )
-if "!SELF_VERIFIED!"=="0" (
-  set "SELF_GOT="
-  for /f "usebackq delims=" %%h in (`powershell -NoProfile -Command "try { (Get-FileHash -Algorithm SHA256 -LiteralPath '!SELF_DL!').Hash.ToLower() } catch { '' }"`) do set "SELF_GOT=%%h"
-  if not defined SELF_GOT (
-    echo [%time%] launcher self-update: have a digest but no usable verifier - refusing.
-    del /f /q "!SELF_DL!" >nul 2>&1
-    goto :eof
-  )
-  if /i not "!SELF_GOT!"=="!SELF_WANT!" (
-    echo [%time%] launcher self-update: SHA-256 verify FAILED for %SELF_NAME% ^(got !SELF_GOT! want !SELF_WANT!^) - discarding.
-    del /f /q "!SELF_DL!" >nul 2>&1
-    goto :eof
-  )
+if /i not "!SELF_GOT!"=="!SELF_WANT!" (
+  echo [%time%] launcher self-update: SHA-256 verify FAILED for %SELF_NAME% ^(got !SELF_GOT! want !SELF_WANT!^) - discarding.
+  del /f /q "!SELF_DL!" >nul 2>&1
+  goto :eof
 )
 
 REM 4. Skip if the on-disk launcher already matches (no needless staging/churn).
